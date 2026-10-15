@@ -3,8 +3,11 @@
 import json
 import os
 import sqlite3
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
+
+from reward import execute
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 
@@ -94,6 +97,25 @@ def load_bird_minidev(data_dir: Path = DATA_DIR) -> list[dict]:
     return examples
 
 
+def filter_train(examples: list[dict]) -> list[dict]:
+    """Drop examples whose gold SQL fails, times out, returns too many rows or an empty result.
+
+    Empty gold results are dropped because any query returning nothing would get full reward.
+    """
+    kept = []
+    removed = Counter()
+    for ex in examples:
+        rows, err = execute(ex["db_path"], ex["gold_sql"])
+        if err is None and not rows:
+            err = "empty"
+        if err is None:
+            kept.append(ex)
+        else:
+            removed[err] += 1
+    print(f"filter_train: kept {len(kept)} of {len(examples)}, removed {dict(removed)}")
+    return kept
+
+
 if __name__ == "__main__":
     datasets = {
         "spider train": load_spider(DATA_DIR, "train"),
@@ -104,6 +126,8 @@ if __name__ == "__main__":
     for name, examples in datasets.items():
         n_dbs = len({ex["db_path"] for ex in examples})
         print(f"{name}: {len(examples)} examples, {n_dbs} unique databases")
+
+    filter_train(datasets["spider train"])
 
     overlap = {ex["db_path"] for ex in datasets["spider train"]} & {ex["db_path"] for ex in datasets["spider dev"]}
     print(f"spider train/dev shared databases: {len(overlap)}")
