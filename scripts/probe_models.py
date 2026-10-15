@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from data import filter_train, load_spider  # noqa: E402
-from prompt import build_messages  # noqa: E402
+from prompt import render_prompt  # noqa: E402
 from reward import check_format, compare, execute, extract_sql, reward  # noqa: E402
 
 DEFAULT_MODELS = [
@@ -46,11 +46,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="results/probe")
+    p.add_argument(
+        "--enable-thinking", choices=["on", "off"], default=None,
+        help="передать enable_thinking в chat template; по умолчанию поведение шаблона",
+    )
     p.add_argument("--smoke", action="store_true", help="20 вопросов, только первая модель")
     args = p.parse_args()
     if args.smoke:
         args.num_questions = 20
         args.models = args.models[:1]
+    args.enable_thinking = {"on": True, "off": False, None: None}[args.enable_thinking]
     return args
 
 
@@ -73,8 +78,13 @@ def classify(text: str, gold_rows: list[tuple], ex: dict) -> str:
     return "correct" if compare(rows, gold_rows, ex["gold_sql"]) else "wrong"
 
 
-def probe_model(model_id: str, examples: list[dict], gold_rows: list, args) -> tuple[list[dict], float]:
-    """Генерирует ответы одной моделью и оценивает их. Возвращает записи и время генерации."""
+def probe_model(
+    model_id: str, examples: list[dict], gold_rows: list, args
+) -> tuple[list[dict], float, str]:
+    """Генерирует ответы одной моделью и оценивает их.
+
+    Возвращает записи, время генерации и последние 40 символов первого промпта.
+    """
     import torch
     from vllm import LLM, SamplingParams
 
@@ -86,10 +96,9 @@ def probe_model(model_id: str, examples: list[dict], gold_rows: list, args) -> t
         seed=args.seed,
     )
     tok = llm.get_tokenizer()
-    prompts = [
-        tok.apply_chat_template(build_messages(ex), tokenize=False, add_generation_prompt=True)
-        for ex in examples
-    ]
+    rendered = [render_prompt(tok, ex, args.enable_thinking) for ex in examples]
+    prompts = [prompt for prompt, _ in rendered]
+    prefixes = [prefix for _, prefix in rendered]
     prompt_lens = [len(tok(p, add_special_tokens=False).input_ids) for p in prompts]
     params = SamplingParams(
         n=args.n, temperature=args.temperature, max_tokens=args.max_tokens, seed=args.seed
@@ -100,14 +109,17 @@ def probe_model(model_id: str, examples: list[dict], gold_rows: list, args) -> t
     gen_time = time.time() - t0
 
     records = []
-    for ex, out, gold, plen in zip(examples, outputs, gold_rows, prompt_lens):
+    for ex, out, gold, plen, prefix in zip(examples, outputs, gold_rows, prompt_lens, prefixes):
         completions = []
         for c in out.outputs:
+            # Оцениваем ответ вместе с тегом, который шаблон дописал в конец промпта
+            full = prefix + c.text
             completions.append({
                 "text": c.text,
-                "reward": reward(c.text, ex["gold_sql"], ex["db_path"]),
-                "outcome": classify(c.text, gold, ex),
-                "format_ok": check_format(c.text),
+                "prefix": prefix,
+                "reward": reward(full, ex["gold_sql"], ex["db_path"]),
+                "outcome": classify(full, gold, ex),
+                "format_ok": check_format(full),
                 "finish_reason": c.finish_reason,
                 "num_tokens": len(c.token_ids),
             })
@@ -122,7 +134,7 @@ def probe_model(model_id: str, examples: list[dict], gold_rows: list, args) -> t
     del llm
     gc.collect()
     torch.cuda.empty_cache()
-    return records, gen_time
+    return records, gen_time, prompts[0][-40:]
 
 
 def summarize(records: list[dict], n: int, gen_time: float) -> dict:
@@ -151,7 +163,9 @@ def summarize(records: list[dict], n: int, gen_time: float) -> dict:
 
 def print_table(summary: dict) -> None:
     models = list(summary)
-    keys = list(next(iter(summary.values())))
+    # enable_thinking и prompt_tail — не числа, в таблицу не идут
+    first = next(iter(summary.values()))
+    keys = [k for k, v in first.items() if isinstance(v, (int, float)) and not isinstance(v, bool)]
     names = [m.split("/")[-1] for m in models]
     width = max(len(n) for n in names) + 2
     print("\n" + "metric".ljust(24) + "".join(n.rjust(width) for n in names))
@@ -180,12 +194,16 @@ def main() -> None:
     summary = {}
     for model_id in args.models:
         print(f"\n=== {model_id} ===")
-        records, gen_time = probe_model(model_id, examples, gold_rows, args)
+        records, gen_time, prompt_tail = probe_model(model_id, examples, gold_rows, args)
         name = model_id.split("/")[-1]
         with open(out_dir / f"{name}.jsonl", "w") as f:
             for r in records:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        summary[model_id] = summarize(records, args.n, gen_time)
+        summary[model_id] = {
+            "enable_thinking": args.enable_thinking,
+            "prompt_tail": prompt_tail,
+            **summarize(records, args.n, gen_time),
+        }
         with open(out_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2)
 
