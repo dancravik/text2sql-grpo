@@ -5,7 +5,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from data import DATA_DIR, load_bird_minidev, load_spider  # noqa: E402
 from reward import execute, extract_sql, reward  # noqa: E402

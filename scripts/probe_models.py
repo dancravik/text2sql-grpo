@@ -21,11 +21,11 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.data import filter_train, load_spider  # noqa: E402
-from src.prompt import build_messages  # noqa: E402
-from src.reward import check_format, compare, execute, extract_sql, reward  # noqa: E402
+from data import filter_train, load_spider  # noqa: E402
+from prompt import build_messages  # noqa: E402
+from reward import check_format, compare, execute, extract_sql, reward  # noqa: E402
 
 DEFAULT_MODELS = [
     "Qwen/Qwen2.5-Coder-0.5B-Instruct",
