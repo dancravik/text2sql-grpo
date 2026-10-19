@@ -9,9 +9,9 @@ FORMAT_BONUS = 0.1
 
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 CODE_FENCE_RE = re.compile(r"^```(?:sql)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
-FORMAT_RE = re.compile(r"\s*<think>.*</think>\s*<answer>.*</answer>\s*", re.DOTALL)
+FORMAT_RE = re.compile(r"<answer>(.*)</answer>", re.DOTALL)
 ORDER_BY_RE = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
-TAGS = ("<think>", "</think>", "<answer>", "</answer>")
+TAGS = ("<answer>", "</answer>")
 
 
 def extract_sql(text: str) -> str | None:
@@ -27,10 +27,11 @@ def extract_sql(text: str) -> str | None:
 
 
 def check_format(text: str) -> bool:
-    """True if text is <think>...</think><answer>...</answer>, each tag exactly once."""
+    """True if text (stripped) is exactly <answer>...</answer>, each tag once, non-empty inside."""
     if any(text.count(tag) != 1 for tag in TAGS):
         return False
-    return FORMAT_RE.fullmatch(text) is not None
+    match = FORMAT_RE.fullmatch(text.strip())
+    return match is not None and match.group(1).strip() != ""
 
 
 def execute(

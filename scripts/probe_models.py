@@ -47,15 +47,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="results/probe")
     p.add_argument(
-        "--enable-thinking", choices=["on", "off"], default=None,
-        help="передать enable_thinking в chat template; по умолчанию поведение шаблона",
+        "--enable-thinking", choices=["on", "off"], default="off",
+        help="enable_thinking для chat template; по умолчанию off (ответ сразу в <answer>)",
     )
     p.add_argument("--smoke", action="store_true", help="20 вопросов, только первая модель")
     args = p.parse_args()
     if args.smoke:
         args.num_questions = 20
         args.models = args.models[:1]
-    args.enable_thinking = {"on": True, "off": False, None: None}[args.enable_thinking]
+    args.enable_thinking = args.enable_thinking == "on"
     return args
 
 

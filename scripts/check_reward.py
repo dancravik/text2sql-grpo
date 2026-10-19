@@ -17,7 +17,7 @@ GOLD = "SELECT count(*) FROM singer"
 
 def wrap(sql: str) -> str:
     """Model answer in the correct format."""
-    return f"<think>Count rows in singer.</think>\n<answer>{sql}</answer>"
+    return f"<answer>{sql}</answer>"
 
 
 def check(name: str, ok: bool) -> bool:
@@ -42,7 +42,8 @@ def manual_cases() -> bool:
         check("no tags -> 0.0", reward(GOLD, GOLD, DB) == 0.0),
         check("format + typo SQL -> 0.1", reward(wrap("SELEC count(*) FROM singer"), GOLD, DB) == 0.1),
         check("format + correct SQL -> 1.1", reward(wrap(GOLD), GOLD, DB) == 1.1),
-        check("correct SQL without <think> -> 1.0", reward(f"<answer>{GOLD}</answer>", GOLD, DB) == 1.0),
+        check("text outside <answer> + correct SQL -> 1.0",
+              reward(f"Here is the query: {wrap(GOLD)}", GOLD, DB) == 1.0),
         check(
             "```sql fence inside <answer> is stripped",
             extract_sql(f"<answer>\n```sql\n{GOLD}\n```\n</answer>") == GOLD
