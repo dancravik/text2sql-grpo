@@ -108,23 +108,36 @@ def load_bird_minidev(data_dir: Path = DATA_DIR) -> list[dict]:
     return examples
 
 
-def filter_train(examples: list[dict]) -> list[dict]:
-    """Drop examples whose gold SQL fails, times out, returns too many rows or an empty result.
-
-    Empty gold results are dropped because any query returning nothing would get full reward.
-    """
+def _filter_by_gold(examples: list[dict], drop_empty: bool, name: str) -> list[dict]:
+    """Drop examples whose gold SQL fails, times out or returns too many rows (and empty, if drop_empty)."""
     kept = []
     removed = Counter()
     for ex in examples:
         rows, err = execute(ex["db_path"], ex["gold_sql"])
-        if err is None and not rows:
+        if err is None and not rows and drop_empty:
             err = "empty"
         if err is None:
             kept.append(ex)
         else:
             removed[err] += 1
-    print(f"filter_train: kept {len(kept)} of {len(examples)}, removed {dict(removed)}")
+    print(f"{name}: kept {len(kept)} of {len(examples)}, removed {dict(removed)}")
     return kept
+
+
+def filter_train(examples: list[dict]) -> list[dict]:
+    """Drop examples whose gold SQL fails, times out, returns too many rows or an empty result.
+
+    Empty gold results are dropped because any query returning nothing would get full reward.
+    """
+    return _filter_by_gold(examples, drop_empty=True, name="filter_train")
+
+
+def filter_eval(examples: list[dict]) -> list[dict]:
+    """Drop examples whose gold SQL can't be scored: fails, times out or returns too many rows.
+
+    Empty gold results are kept: in evaluation nothing is learned from them, so they can't be exploited.
+    """
+    return _filter_by_gold(examples, drop_empty=False, name="filter_eval")
 
 
 if __name__ == "__main__":
