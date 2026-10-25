@@ -14,7 +14,6 @@ import json
 import os
 import random
 import sys
-import time
 from collections import Counter
 from pathlib import Path
 
@@ -25,7 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from data import filter_train, load_spider  # noqa: E402
 from prompt import render_prompt  # noqa: E402
-from reward import check_format, compare, execute, extract_sql, reward  # noqa: E402
+from sampling import load_llm, sample_and_score  # noqa: E402
 
 DEFAULT_MODELS = [
     "Qwen/Qwen2.5-Coder-0.5B-Instruct",
@@ -67,79 +66,33 @@ def sample_examples(num: int, seed: int) -> list[dict]:
     return rng.sample(examples, min(num, len(examples)))
 
 
-def classify(text: str, gold_rows: list[tuple], ex: dict) -> str:
-    """Тип исхода: no_sql | exec_error | wrong | correct."""
-    sql = extract_sql(text)
-    if sql is None:
-        return "no_sql"
-    rows, err = execute(ex["db_path"], sql)
-    if err is not None:
-        return "exec_error"
-    return "correct" if compare(rows, gold_rows, ex["gold_sql"]) else "wrong"
-
-
-def probe_model(
-    model_id: str, examples: list[dict], gold_rows: list, args
-) -> tuple[list[dict], float, str]:
+def probe_model(model_id: str, examples: list[dict], args) -> tuple[list[dict], float, str]:
     """Генерирует ответы одной моделью и оценивает их.
 
     Возвращает записи, время генерации и последние 40 символов первого промпта.
     """
     import torch
-    from vllm import LLM, SamplingParams
 
-    llm = LLM(
-        model=model_id,
-        dtype="half",
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=0.9,
-        seed=args.seed,
+    llm = load_llm(model_id, args.max_model_len, args.seed)
+    records, gen_time = sample_and_score(
+        llm, examples, args.n, args.temperature, args.max_tokens, args.seed, args.enable_thinking
     )
-    tok = llm.get_tokenizer()
-    rendered = [render_prompt(tok, ex, args.enable_thinking) for ex in examples]
-    prompts = [prompt for prompt, _ in rendered]
-    prefixes = [prefix for _, prefix in rendered]
-    prompt_lens = [len(tok(p, add_special_tokens=False).input_ids) for p in prompts]
-    params = SamplingParams(
-        n=args.n, temperature=args.temperature, max_tokens=args.max_tokens, seed=args.seed
-    )
-
-    t0 = time.time()
-    outputs = llm.generate(prompts, params)
-    gen_time = time.time() - t0
-
-    records = []
-    for ex, out, gold, plen, prefix in zip(examples, outputs, gold_rows, prompt_lens, prefixes):
-        completions = []
-        for c in out.outputs:
-            # Оцениваем ответ вместе с тегом, который шаблон дописал в конец промпта
-            full = prefix + c.text
-            completions.append({
-                "text": c.text,
-                "prefix": prefix,
-                "reward": reward(full, ex["gold_sql"], ex["db_path"]),
-                "outcome": classify(full, gold, ex),
-                "format_ok": check_format(full),
-                "finish_reason": c.finish_reason,
-                "num_tokens": len(c.token_ids),
-            })
-        records.append({
-            "question": ex["question"],
-            "gold_sql": ex["gold_sql"],
-            "db_path": ex["db_path"],
-            "prompt_tokens": plen,
-            "completions": completions,
-        })
+    prompt_tail = render_prompt(llm.get_tokenizer(), examples[0], args.enable_thinking)[0][-40:]
+    # Вопрос, эталон и путь к базе — как раньше, чтобы ответы можно было читать глазами
+    records = [
+        {"question": ex["question"], "gold_sql": ex["gold_sql"], "db_path": ex["db_path"], **r}
+        for ex, r in zip(examples, records, strict=True)
+    ]
 
     del llm
     gc.collect()
     torch.cuda.empty_cache()
-    return records, gen_time, prompts[0][-40:]
+    return records, gen_time, prompt_tail
 
 
 def summarize(records: list[dict], n: int, gen_time: float) -> dict:
     """Сводная статистика по одной модели."""
-    k_correct = np.array([sum(c["outcome"] == "correct" for c in r["completions"]) for r in records])
+    k_correct = np.array([r["k_correct"] for r in records])
     comps = [c for r in records for c in r["completions"]]
     outcomes = Counter(c["outcome"] for c in comps)
     prompt_lens = np.array([r["prompt_tokens"] for r in records])
@@ -183,18 +136,12 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     examples = sample_examples(args.num_questions, args.seed)
-    gold_rows = []
-    for ex in examples:
-        rows, err = execute(ex["db_path"], ex["gold_sql"])
-        if err is not None:
-            raise RuntimeError(f"Gold SQL failed ({err}) after filtering: {ex['gold_sql']}")
-        gold_rows.append(rows)
     print(f"Questions: {len(examples)}, samples per question: {args.n}")
 
     summary = {}
     for model_id in args.models:
         print(f"\n=== {model_id} ===")
-        records, gen_time, prompt_tail = probe_model(model_id, examples, gold_rows, args)
+        records, gen_time, prompt_tail = probe_model(model_id, examples, args)
         name = model_id.split("/")[-1]
         with open(out_dir / f"{name}.jsonl", "w") as f:
             for r in records:

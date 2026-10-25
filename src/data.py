@@ -31,6 +31,8 @@ def get_schema(db_path: str) -> str:
 
 
 def _make_example(
+    id: str,
+    db_id: str,
     question: str,
     gold_sql: str,
     db_path: Path,
@@ -40,6 +42,8 @@ def _make_example(
 ) -> dict:
     """Build one example in the common format."""
     return {
+        "id": id,
+        "db_id": db_id,
         "question": question,
         "gold_sql": gold_sql,
         "db_path": str(db_path),
@@ -51,7 +55,7 @@ def _make_example(
 
 
 def load_spider(data_dir: Path = DATA_DIR, split: str = "train") -> list[dict]:
-    """Load Spider train or dev split."""
+    """Load Spider train or dev split; id is "spider_{split}_{index in the source json}"."""
     if split not in SPIDER_FILES:
         raise ValueError(f"Unknown Spider split: {split!r}, expected one of {list(SPIDER_FILES)}")
     root = Path(data_dir) / "spider"
@@ -59,6 +63,8 @@ def load_spider(data_dir: Path = DATA_DIR, split: str = "train") -> list[dict]:
         raw = json.load(f)
     return [
         _make_example(
+            id=f"spider_{split}_{i}",
+            db_id=item["db_id"],
             question=item["question"],
             gold_sql=item["query"],
             db_path=root / "database" / item["db_id"] / f"{item['db_id']}.sqlite",
@@ -66,25 +72,30 @@ def load_spider(data_dir: Path = DATA_DIR, split: str = "train") -> list[dict]:
             difficulty=None,
             source="spider",
         )
-        for item in raw
+        for i, item in enumerate(raw)
     ]
 
 
 def load_bird_minidev(data_dir: Path = DATA_DIR) -> list[dict]:
-    """Load BIRD mini-dev (SQLite version), dropping duplicate (db_id, question) pairs."""
+    """Load BIRD mini-dev (SQLite version), dropping duplicate (db_id, question) pairs.
+
+    id is "bird_minidev_{index in the source json}", so it stays stable after deduplication.
+    """
     root = Path(data_dir) / "minidev" / "MINIDEV"
     with open(root / "mini_dev_sqlite.json", encoding="utf-8") as f:
         raw = json.load(f)
 
     examples = []
     seen = set()
-    for item in raw:
+    for i, item in enumerate(raw):
         key = (item["db_id"], item["question"])
         if key in seen:
             continue
         seen.add(key)
         examples.append(
             _make_example(
+                id=f"bird_minidev_{i}",
+                db_id=item["db_id"],
                 question=item["question"],
                 gold_sql=item["SQL"],
                 db_path=root / "dev_databases" / item["db_id"] / f"{item['db_id']}.sqlite",
