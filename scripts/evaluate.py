@@ -1,16 +1,16 @@
-"""Оценка модели на Spider dev и BIRD Mini-Dev: execution accuracy и разбивка ошибок.
+"""Оценка модели на фиксированных выборках: execution accuracy и разбивка ошибок.
 
 По умолчанию greedy (temperature 0, один ответ на вопрос): доля верных ответов = execution accuracy.
 С --n 8 --temperature 0.8 получаются pass@1 и pass@8 при сэмплировании.
 
-Вопросы, эталон которых нельзя проверить (ошибка, таймаут, больше 10 000 строк), исключаются
-(filter_eval); их число пишется в metrics.json.
+Списки ID и исключения загружаются из splits/v1.json без повторной фильтрации.
+По умолчанию используется validation. Финальные test_spider/test_bird запускаются явно.
 
 Модель — id на Hugging Face или локальная папка (для обученной: базовая модель с влитым LoRA).
 
 Запуск (из корня репозитория):
     DATA_DIR=/kaggle/input/<dataset> python scripts/evaluate.py --model Qwen/Qwen3.5-2B --smoke
-    DATA_DIR=/kaggle/input/<dataset> python scripts/evaluate.py --model Qwen/Qwen3.5-2B
+    DATA_DIR=/kaggle/input/<dataset> python scripts/evaluate.py --model Qwen/Qwen3.5-2B --datasets validation_fast
 """
 
 import argparse
@@ -22,14 +22,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from data import DATA_DIR, filter_eval, load_bird_minidev, load_spider  # noqa: E402
+from data import DATA_DIR  # noqa: E402
 from prompt import render_prompt  # noqa: E402
 from sampling import load_llm, sample_and_score  # noqa: E402
+from splits import DEFAULT_MANIFEST, load_split, read_manifest, sha256_file  # noqa: E402
 
-LOADERS = {
-    "spider_dev": lambda: load_spider(DATA_DIR, "dev"),
-    "bird_minidev": lambda: load_bird_minidev(DATA_DIR),
-}
+EVAL_SPLITS = ("validation", "validation_fast", "test_spider", "test_bird")
 OUTCOMES = ["no_sql", "exec_error", "wrong", "correct"]
 
 
@@ -37,7 +35,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--name", default=None, help="имя папки с результатами; по умолчанию последняя часть --model")
-    p.add_argument("--datasets", nargs="+", choices=list(LOADERS), default=list(LOADERS))
+    p.add_argument("--datasets", nargs="+", choices=EVAL_SPLITS, default=["validation"])
+    p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
     p.add_argument("--n", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=1024)
@@ -111,14 +110,19 @@ def main() -> None:
     out_dir = Path(args.out_dir) / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest = read_manifest(Path(args.manifest))
+    # Verify data before allocating the GPU; never silently remove failed golds.
+    datasets = {name: load_split(name, DATA_DIR, Path(args.manifest)) for name in args.datasets}
     llm = load_llm(args.model, args.max_model_len, args.seed)
-    report = {"model": args.model, "args": vars(args), "datasets": {}}
+    report = {
+        "model": args.model, "args": vars(args), "datasets": {},
+        "manifest_sha256": sha256_file(Path(args.manifest)),
+    }
 
     for dataset in args.datasets:
         print(f"\n=== {dataset} ===")
-        loaded = LOADERS[dataset]()
-        examples = filter_eval(loaded)
-        num_excluded = len(loaded) - len(examples)
+        examples = datasets[dataset]
+        num_excluded = len(manifest["splits"][dataset]["excluded"])
         if args.smoke:
             examples = examples[:20]
         check_lengths(llm.get_tokenizer(), examples, args)
