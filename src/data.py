@@ -135,7 +135,8 @@ def filter_train(examples: list[dict]) -> list[dict]:
 def filter_eval(examples: list[dict]) -> list[dict]:
     """Drop examples whose gold SQL can't be scored: fails, times out or returns too many rows.
 
-    Empty gold results are kept: in evaluation nothing is learned from them, so they can't be exploited.
+    Empty gold results are kept to avoid changing evaluation coverage. They can still
+    produce false positives under execution matching on a single database instance.
     """
     return _filter_by_gold(examples, drop_empty=False, name="filter_eval")
 

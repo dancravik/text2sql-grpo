@@ -1,0 +1,124 @@
+
+{
+  "description": "Metrics of the two finalist models: candidate probe (vLLM generation) and GRPO+LoRA feasibility test on T4",
+  "decision": {
+    "chosen_model": "Qwen/Qwen3.5-2B",
+    "mode": "non-thinking (enable_thinking=False), answer format <answer>SQL</answer>",
+    "reason": "strongest baseline (highest pass@1); trains on a single T4 with LoRA"
+  },
+  "probe": {
+    "settings": {
+      "dataset": "Spider train after filter_train (6737), random sample",
+      "num_questions": 500,
+      "seed": 42,
+      "samples_per_question": 8,
+      "temperature": 0.8,
+      "max_tokens": 1024,
+      "engine": "vLLM 0.31, fp16, 1x T4",
+      "system_prompt": "old format: <think>...</think><answer>...</answer>",
+      "note": "values rounded to 3 decimals as printed in the summary table"
+    },
+    "models": {
+      "Qwen/Qwen2.5-Coder-1.5B-Instruct": {
+        "enable_thinking": "n/a (no thinking mode in template)",
+        "frac_0_of_n": 0.24,
+        "frac_signal": 0.722,
+        "frac_n_of_n": 0.038,
+        "pass@1": 0.377,
+        "pass@8": 0.76,
+        "format_ok": 0.544,
+        "out_no_sql": 0.116,
+        "out_exec_error": 0.293,
+        "out_wrong": 0.214,
+        "out_correct": 0.377,
+        "truncated": 0,
+        "prompt_tokens_mean": 496,
+        "prompt_tokens_p95": 1302,
+        "completion_tokens_mean": 205,
+        "gen_time_s": 536,
+        "output_tokens_per_s": 1532
+      },
+      "Qwen/Qwen3.5-2B": {
+        "enable_thinking": false,
+        "frac_0_of_n": 0.272,
+        "frac_signal": 0.588,
+        "frac_n_of_n": 0.14,
+        "pass@1": 0.44,
+        "pass@8": 0.728,
+        "format_ok": 0.001,
+        "format_ok_note": "not comparable: template inserts empty <think></think> into the prompt in non-thinking mode",
+        "out_no_sql": 0.033,
+        "out_exec_error": 0.235,
+        "out_wrong": 0.293,
+        "out_correct": 0.44,
+        "truncated": 0.009,
+        "prompt_tokens_mean": 548,
+        "prompt_tokens_p95": 1412,
+        "completion_tokens_mean": 65,
+        "gen_time_s": 624,
+        "output_tokens_per_s": 419
+      }
+    }
+  },
+  "feasibility": {
+    "settings": {
+      "num_questions": 64,
+      "steps": 10,
+      "prompts_per_step": 4,
+      "num_generations": 8,
+      "max_completion_length": 512,
+      "lora_r": 16,
+      "lora_alpha": 32,
+      "learning_rate": 0.000005,
+      "beta": 0,
+      "precision": "fp16",
+      "gradient_checkpointing": true,
+      "generation": "transformers (no vLLM)",
+      "hardware": "1x T4 16 GB",
+      "versions": "trl 1.16.0, peft 0.20.0, torch 2.13.0+cu130, transformers 5.16.1",
+      "note": "first step is warm-up and excluded from mean step time"
+    },
+    "models": {
+      "Qwen/Qwen2.5-Coder-1.5B-Instruct": {
+        "status": "ok",
+        "num_params": 1543714304,
+        "trainable_params": 18464768,
+        "peak_memory_gb": 9.38,
+        "peak_reserved_gb": 10.324,
+        "mean_step_time_s": 74.554,
+        "mean_reward": 0.433,
+        "mean_completion_length": 198.486,
+        "grad_norm_nan_steps": 0,
+        "grad_norm_range": [
+          0.136,
+          0.179
+        ],
+        "mean_frac_reward_zero_std": 0.025,
+        "max_clipped_ratio": 0
+      },
+      "Qwen/Qwen3.5-2B": {
+        "status": "ok",
+        "text_only_loaded": true,
+        "num_params": 1881825088,
+        "trainable_params": 16819200,
+        "peak_memory_gb": 10.75,
+        "peak_reserved_gb": 11.547,
+        "mean_step_time_s": 87.617,
+        "mean_reward": 0.378,
+        "mean_completion_length": 54.326,
+        "grad_norm_nan_steps": 4,
+        "grad_norm_nan_note": "steps 1-4 skipped by fp16 loss scaler warm-up, finite from step 5",
+        "grad_norm_range_finite": [
+          0.441,
+          0.812
+        ],
+        "zero_grad_steps": [
+          6
+        ],
+        "zero_grad_note": "step 6: all 4 groups had identical rewards (frac_reward_zero_std = 1.0)",
+        "mean_frac_reward_zero_std": 0.5,
+        "max_clipped_ratio": 0.0625
+      }
+    }
+  }
+}
