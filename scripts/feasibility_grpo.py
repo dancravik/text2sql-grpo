@@ -49,9 +49,10 @@ from trl import GRPOConfig, GRPOTrainer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from data import DATA_DIR, filter_train, load_spider  # noqa: E402
+from data import DATA_DIR  # noqa: E402
 from prompt import render_prompt  # noqa: E402
 from reward import reward  # noqa: E402
+from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
 
 GB = 1024**3
 # Ключи из логов trl, которые сохраняем по каждому шагу
@@ -62,6 +63,7 @@ VISION_MARKERS = ("visual", "vision")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
+    p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
     p.add_argument("--num-questions", type=int, default=64)
     p.add_argument("--num-generations", type=int, default=8)
     p.add_argument("--prompts-per-step", type=int, default=4)
@@ -117,7 +119,7 @@ def versions() -> dict[str, str | None]:
 
 def build_dataset(tokenizer, args: argparse.Namespace) -> tuple[Dataset, list[int]]:
     """Готовые промпты из render_prompt + поля для награды; возвращает датасет и длины промптов."""
-    examples = filter_train(load_spider(DATA_DIR, "train"))
+    examples = load_split("train", DATA_DIR, Path(args.manifest))
     examples = random.Random(args.seed).sample(examples, min(args.num_questions, len(examples)))
     enable_thinking = args.enable_thinking == "on"
 
@@ -131,6 +133,7 @@ def build_dataset(tokenizer, args: argparse.Namespace) -> tuple[Dataset, list[in
             raise RuntimeError("Tokenizer adds special tokens: trl prompt would differ from render_prompt")
         prompt_lens.append(len(ids))
         rows.append({
+            "example_id": ex["id"],
             "prompt": prompt,
             "completion_prefix": prefix,
             "gold_sql": ex["gold_sql"],
@@ -280,6 +283,8 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     """Загрузка модели, LoRA, GRPOTrainer и обучение на max_steps шагов; заполняет report."""
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     dataset, prompt_lens = build_dataset(tokenizer, args)
+    report["manifest_sha256"] = sha256_file(Path(args.manifest))
+    report["train_example_ids"] = list(dataset["example_id"])
     report["prompt_tokens_mean"] = sum(prompt_lens) / len(prompt_lens)
     report["prompt_tokens_max"] = max(prompt_lens)
     print(f"Dataset: {len(dataset)} prompts, tokens mean {report['prompt_tokens_mean']:.0f}, max {max(prompt_lens)}")

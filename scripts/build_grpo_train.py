@@ -1,7 +1,9 @@
-"""Отбор вопросов для GRPO: оставляем те, где модель решает часть из n попыток (1..n-1).
+"""Опциональная абляция: отбор вопросов из frozen train по успехам модели (1..n-1).
 
-Если все n ответов одинаково верны или неверны, награды в группе равны, advantage нулевой,
-и вопрос не даёт сигнала для обучения.
+Основные SFT и GRPO используют общий train из splits/v1.json БЕЗ этого отбора.
+Этот скрипт не меняет основной train и не читает validation/test.
+При равной итоговой награде advantage нулевой; одинаковая правильность сама по себе
+не гарантирует равенство наград, поскольку есть отдельный бонус за формат.
 
 Результаты пишутся по кускам в {out_dir}/counts.jsonl; при перезапуске уже обработанные
 вопросы пропускаются. Итог — {out_dir}/grpo_train_ids.json (id восстанавливаются через load_spider).
@@ -19,13 +21,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from data import DATA_DIR, filter_train, load_spider  # noqa: E402
+from data import DATA_DIR  # noqa: E402
 from sampling import load_llm, sample_and_score  # noqa: E402
+from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3.5-2B")
+    p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
     p.add_argument("--n", type=int, default=8)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--max-tokens", type=int, default=512)
@@ -36,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         "--enable-thinking", choices=["on", "off"], default="off",
         help="enable_thinking для chat template; по умолчанию off (ответ сразу в <answer>)",
     )
-    p.add_argument("--out-dir", default="results/grpo_train")
+    p.add_argument("--out-dir", default="results/grpo_train_ablation_v1")
     p.add_argument("--smoke", action="store_true", help="первые 40 вопросов")
     args = p.parse_args()
     args.enable_thinking = args.enable_thinking == "on"
@@ -63,7 +67,22 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     counts_path = out_dir / "counts.jsonl"
 
-    examples = filter_train(load_spider(DATA_DIR, "train"))
+    # Resuming may not mix models, generation settings or dataset versions.
+    run_config = {
+        key: value for key, value in vars(args).items()
+        if key not in {"out_dir", "manifest", "chunk_size", "smoke"}
+    }
+    run_config["manifest_sha256"] = sha256_file(Path(args.manifest))
+    config_path = out_dir / "run_config.json"
+    if config_path.exists():
+        if json.loads(config_path.read_text()) != run_config:
+            raise ValueError("Run configuration changed; use another --out-dir")
+    else:
+        if counts_path.exists():
+            raise ValueError("Existing counts lack provenance; use another --out-dir")
+        config_path.write_text(json.dumps(run_config, indent=2) + "\n")
+
+    examples = load_split("train", DATA_DIR, Path(args.manifest))
     if args.smoke:
         examples = examples[:40]
 
