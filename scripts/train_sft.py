@@ -1,0 +1,242 @@
+"""Train Qwen3.5-2B with LoRA on frozen Spider train and export it for evaluate.py."""
+
+import argparse
+import importlib.metadata
+import json
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from comet_tracking import start_experiment  # noqa: E402
+from data import DATA_DIR  # noqa: E402
+from prompt import render_prompt  # noqa: E402
+from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
+
+IGNORE_INDEX = -100
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--revision", default=None, help="Optional Hugging Face model revision")
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--num-train-examples", type=int, help="Seeded subset for trials")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--max-length", type=int, default=4096)
+    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument("--save-steps", type=int, default=100)
+    duration = parser.add_mutually_exclusive_group()
+    duration.add_argument("--epochs", type=float, default=1.0)
+    duration.add_argument("--max-steps", type=int)
+    duration.add_argument("--smoke", action="store_true", help="8 steps, 64 train examples, batch 1 x 4")
+    parser.add_argument("--comet", action="store_true", help="Track this run using COMET_API_KEY")
+    args = parser.parse_args()
+    if args.smoke:
+        args.max_steps = 8
+        args.num_train_examples = 64
+        args.micro_batch_size = 1
+        args.grad_accum = 4
+        args.logging_steps = 1
+    for name in ("num_train_examples", "lora_r", "lora_alpha", "micro_batch_size", "grad_accum",
+                 "max_length", "logging_steps", "save_steps", "max_steps", "epochs", "learning_rate"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not 0 <= args.warmup_ratio < 1:
+        parser.error("--warmup-ratio must be in [0, 1)")
+    if args.out_dir.exists():
+        parser.error(f"Output already exists: {args.out_dir}. Pick a new directory for each trial.")
+    return args
+
+
+def encode_example(tokenizer, example: dict, max_length: int) -> dict:
+    prompt, _ = render_prompt(tokenizer, example, enable_thinking=False)
+    prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+    answer = f"<answer>{example['gold_sql'].strip()}</answer>"
+    answer_ids = tokenizer(answer, add_special_tokens=False).input_ids + [tokenizer.eos_token_id]
+    input_ids = prompt_ids + answer_ids
+    if len(input_ids) > max_length:
+        raise ValueError(f"{example['id']} has {len(input_ids)} tokens, above --max-length={max_length}")
+    return {"input_ids": input_ids, "labels": [IGNORE_INDEX] * len(prompt_ids) + answer_ids}
+
+
+def collate_batch(tokenizer, examples: list[dict]) -> dict:
+    import torch
+
+    batch = tokenizer.pad([{"input_ids": ex["input_ids"]} for ex in examples], return_tensors="pt")
+    width = batch["input_ids"].shape[1]
+    batch["labels"] = torch.tensor(
+        [ex["labels"] + [IGNORE_INDEX] * (width - len(ex["labels"])) for ex in examples],
+        dtype=torch.long,
+    )
+    return batch
+
+
+def train(args: argparse.Namespace, experiment) -> dict:
+    from functools import partial
+
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import (
+        AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, Trainer,
+        TrainerCallback, TrainingArguments, set_seed,
+    )
+
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError("Expected one visible GPU. Set CUDA_VISIBLE_DEVICES=0 on Kaggle.")
+    set_seed(args.seed)
+    examples = load_split("train", DATA_DIR, args.manifest)
+    if args.num_train_examples is not None:
+        if args.num_train_examples > len(examples):
+            raise ValueError(f"Requested {args.num_train_examples} train examples, have {len(examples)}")
+        examples = random.Random(args.seed).sample(examples, args.num_train_examples)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    tokenizer.padding_side = "right"
+    if tokenizer.eos_token_id is None:
+        raise ValueError("The tokenizer must have an EOS token")
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    dataset = [encode_example(tokenizer, ex, args.max_length) for ex in examples]
+
+    # Keep the checkpoint architecture used by vLLM for Qwen3.5. Only text LoRA is trainable.
+    base = AutoModelForImageTextToText.from_pretrained(
+        args.model, revision=args.revision, dtype=torch.float16, attn_implementation="sdpa",
+    )
+    revision = getattr(base.config, "_commit_hash", None) or args.revision
+    base.config.use_cache = False
+    model = get_peft_model(base, LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=0.0,
+        target_modules="all-linear",
+        exclude_modules=r".*(visual|vision).*",
+        task_type="CAUSAL_LM",
+        revision=revision,
+    ))
+    trainable = [param for param in model.parameters() if param.requires_grad]
+    if {param.dtype for param in trainable} != {torch.float32}:
+        raise RuntimeError("FP16 training requires FP32 LoRA parameters")
+
+    class CometCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs:
+                metrics = {name: value for name, value in logs.items()
+                           if isinstance(value, (int, float)) and math.isfinite(value)}
+                experiment.log_metrics(metrics, step=state.global_step)
+
+    config = TrainingArguments(
+        output_dir=str(args.out_dir / "checkpoints"),
+        learning_rate=args.learning_rate,
+        num_train_epochs=args.epochs,
+        max_steps=args.max_steps if args.max_steps is not None else -1,
+        per_device_train_batch_size=args.micro_batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        warmup_steps=args.warmup_ratio,
+        lr_scheduler_type="linear",
+        optim="adamw_torch",
+        fp16=True,
+        bf16=False,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        logging_steps=args.logging_steps,
+        logging_first_step=True,
+        logging_nan_inf_filter=False,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=2,
+        seed=args.seed,
+        data_seed=args.seed,
+        label_names=["labels"],
+        report_to="none",
+    )
+    trainer = Trainer(
+        model=model,
+        args=config,
+        train_dataset=dataset,
+        data_collator=partial(collate_batch, tokenizer),
+        processing_class=tokenizer,
+        callbacks=[CometCallback()] if experiment is not None else [],
+    )
+    report = {
+        "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "base_revision": revision,
+        "manifest_sha256": sha256_file(args.manifest),
+        "train_example_ids": [ex["id"] for ex in examples],
+        "num_train_examples": len(examples),
+        "effective_batch_size": args.micro_batch_size * args.grad_accum,
+        "trainable_params": sum(param.numel() for param in trainable),
+        "gpu": torch.cuda.get_device_name(0),
+        "versions": {pkg: importlib.metadata.version(pkg) for pkg in ("torch", "transformers", "accelerate", "peft")},
+        "comet_experiment_key": experiment.get_key() if experiment is not None else None,
+    }
+    if experiment is not None:
+        experiment.log_parameters(report["args"] | {
+            key: report[key] for key in ("base_revision", "manifest_sha256", "num_train_examples",
+                                         "effective_batch_size", "trainable_params", "gpu")
+        })
+
+    torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
+    result = trainer.train()
+    torch.cuda.synchronize()
+    seconds = time.perf_counter() - started
+    if not math.isfinite(result.training_loss):
+        raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
+    if not any(torch.count_nonzero(param).item() for name, param in model.named_parameters()
+               if param.requires_grad and ".lora_B." in name):
+        raise RuntimeError("LoRA weights were not updated. Check for skipped FP16 optimizer steps.")
+
+    report.update(
+        global_step=trainer.state.global_step,
+        train_loss=result.training_loss,
+        train_seconds=seconds,
+        gpu_hours=seconds / 3600,
+        peak_allocated_gib=torch.cuda.max_memory_allocated() / 1024**3,
+        log_history=[
+            {key: None if isinstance(value, float) and not math.isfinite(value) else value
+             for key, value in entry.items()}
+            for entry in trainer.state.log_history
+        ],
+    )
+    model.save_pretrained(args.out_dir / "adapter")
+    tokenizer.save_pretrained(args.out_dir / "adapter")
+    merged = model.merge_and_unload(safe_merge=True)
+    merged.config.use_cache = True
+    merged.save_pretrained(args.out_dir / "merged")
+    AutoProcessor.from_pretrained(args.model, revision=revision).save_pretrained(args.out_dir / "merged")
+    (args.out_dir / "run.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    return report
+
+
+def main() -> None:
+    args = parse_args()
+    experiment = start_experiment(name=args.out_dir.name) if args.comet else None
+    try:
+        args.out_dir.mkdir(parents=True, exist_ok=False)
+        report = train(args, experiment)
+        print(f"Saved adapter, merged model and run.json to {args.out_dir}")
+        if experiment is not None:
+            experiment.log_metrics(
+                {key: report[key] for key in ("train_seconds", "gpu_hours", "peak_allocated_gib")},
+                step=report["global_step"],
+            )
+    finally:
+        if experiment is not None:
+            experiment.end()
+
+
+if __name__ == "__main__":
+    main()

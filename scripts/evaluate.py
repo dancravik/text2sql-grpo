@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from data import DATA_DIR  # noqa: E402
+from comet_tracking import start_experiment  # noqa: E402
 from prompt import render_prompt  # noqa: E402
 from sampling import load_llm, sample_and_score  # noqa: E402
 from splits import DEFAULT_MANIFEST, load_split, read_manifest, sha256_file  # noqa: E402
@@ -37,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--name", default=None, help="имя папки с результатами; по умолчанию последняя часть --model")
     p.add_argument("--datasets", nargs="+", choices=EVAL_SPLITS, default=["validation"])
     p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
+    p.add_argument("--comet-run", type=Path, help="SFT run.json to attach evaluation metrics to its Comet run")
     p.add_argument("--n", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=1024)
@@ -107,16 +109,28 @@ def summarize(records: list[dict], n: int, gen_time: float) -> dict:
 
 def main() -> None:
     args = parse_args()
+    manifest_path = Path(args.manifest)
+    manifest_sha = sha256_file(manifest_path)
+    training_run = None
+    if args.comet_run is not None:
+        training_run = json.loads(args.comet_run.read_text(encoding="utf-8"))
+        if not training_run.get("comet_experiment_key"):
+            raise ValueError("The SFT run has no Comet experiment. Train with --comet first.")
+        if training_run["manifest_sha256"] != manifest_sha:
+            raise ValueError("The SFT run and evaluation use different dataset manifests")
+        if Path(args.model).resolve() != (args.comet_run.parent / "merged").resolve():
+            raise ValueError("--model must point to the merged model next to the SFT run.json")
+
     out_dir = Path(args.out_dir) / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = read_manifest(Path(args.manifest))
+    manifest = read_manifest(manifest_path)
     # Verify data before allocating the GPU; never silently remove failed golds.
-    datasets = {name: load_split(name, DATA_DIR, Path(args.manifest)) for name in args.datasets}
+    datasets = {name: load_split(name, DATA_DIR, manifest_path) for name in args.datasets}
     llm = load_llm(args.model, args.max_model_len, args.seed)
     report = {
-        "model": args.model, "args": vars(args), "datasets": {},
-        "manifest_sha256": sha256_file(Path(args.manifest)),
+        "model": args.model, "args": vars(args) | {"comet_run": str(args.comet_run) if args.comet_run else None},
+        "datasets": {}, "manifest_sha256": manifest_sha,
     }
 
     for dataset in args.datasets:
@@ -154,6 +168,18 @@ def main() -> None:
             print(f"  {d:<11}{m['accuracy']:.3f} ({m['num_questions']})")
 
     print(f"\nSaved to {out_dir}")
+    if training_run is not None:
+        experiment = start_experiment(key=training_run["comet_experiment_key"])
+        try:
+            prefix = "smoke/" if args.smoke else ""
+            for dataset, metrics in report["datasets"].items():
+                experiment.log_metrics(
+                    {f"{prefix}{dataset}/{name}": value for name, value in metrics.items()
+                     if isinstance(value, (int, float))},
+                    step=training_run["global_step"],
+                )
+        finally:
+            experiment.end()
 
 
 if __name__ == "__main__":
