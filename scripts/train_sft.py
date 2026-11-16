@@ -18,6 +18,8 @@ from prompt import render_prompt  # noqa: E402
 from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
 
 IGNORE_INDEX = -100
+GIB = 1024**3
+BATCH_PROBE_OOM_EXIT = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,8 +45,11 @@ def parse_args() -> argparse.Namespace:
     duration.add_argument("--epochs", type=float, default=1.0)
     duration.add_argument("--max-steps", type=int)
     duration.add_argument("--smoke", action="store_true", help="8 steps, 64 train examples, batch 1 x 4")
+    parser.add_argument("--batch-probe", action="store_true", help="Measure training memory without exporting a model")
     parser.add_argument("--comet", action="store_true", help="Track this run using COMET_API_KEY")
     args = parser.parse_args()
+    if args.batch_probe and args.max_steps is None:
+        parser.error("--batch-probe requires an explicit --max-steps")
     if args.smoke:
         args.max_steps = 8
         args.num_train_examples = 64
@@ -135,10 +140,36 @@ def train(args: argparse.Namespace, experiment) -> dict:
         raise RuntimeError("FP16 training requires FP32 LoRA parameters")
 
     class OptimizerStats(TrainerCallback):
-        skipped = 0
+        def __init__(self):
+            self.skipped = 0
+            self.step_started = None
+            self.probe_steps = []
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            if probe:
+                torch.cuda.reset_peak_memory_stats()
+                self.step_started = time.perf_counter()
 
         def on_optimizer_step(self, args, state, control, **kwargs):
             self.skipped += int(trainer.accelerator.optimizer_step_was_skipped)
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if probe:
+                torch.cuda.synchronize()
+                self.record_probe_step(state.global_step, oom=False)
+
+        def record_probe_step(self, step, oom):
+            metrics = {
+                "step_peak_allocated_gib": torch.cuda.max_memory_allocated() / GIB,
+                "step_peak_reserved_gib": torch.cuda.max_memory_reserved() / GIB,
+                "cuda_oom": int(oom),
+            }
+            if self.step_started is not None:
+                metrics["step_seconds"] = time.perf_counter() - self.step_started
+            self.probe_steps.append({"step": step, **metrics})
+            self.step_started = None
+            if experiment is not None:
+                experiment.log_metrics(metrics, step=step)
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if experiment is not None and logs:
@@ -146,8 +177,12 @@ def train(args: argparse.Namespace, experiment) -> dict:
                            if isinstance(value, (int, float)) and math.isfinite(value)}
                 metrics["optimizer_steps_skipped"] = self.skipped
                 metrics["fp16_loss_scale"] = trainer.accelerator.scaler.get_scale()
+                if not probe:
+                    metrics["peak_allocated_gib_so_far"] = torch.cuda.max_memory_allocated() / GIB
+                    metrics["peak_reserved_gib_so_far"] = torch.cuda.max_memory_reserved() / GIB
                 experiment.log_metrics(metrics, step=state.global_step)
 
+    probe = args.batch_probe
     config = TrainingArguments(
         output_dir=str(args.out_dir / "checkpoints"),
         learning_rate=args.learning_rate,
@@ -165,7 +200,7 @@ def train(args: argparse.Namespace, experiment) -> dict:
         logging_steps=args.logging_steps,
         logging_first_step=True,
         logging_nan_inf_filter=False,
-        save_strategy="steps",
+        save_strategy="no" if probe else "steps",
         save_steps=args.save_steps,
         save_total_limit=2,
         seed=args.seed,
@@ -198,6 +233,7 @@ def train(args: argparse.Namespace, experiment) -> dict:
         "effective_batch_size": args.micro_batch_size * args.grad_accum,
         "trainable_params": sum(param.numel() for param in trainable),
         "gpu": torch.cuda.get_device_name(0),
+        "gpu_total_gib": torch.cuda.get_device_properties(0).total_memory / GIB,
         "versions": {pkg: importlib.metadata.version(pkg) for pkg in ("torch", "transformers", "accelerate", "peft")},
         "comet_experiment_key": experiment.get_key() if experiment is not None else None,
     }
@@ -209,39 +245,60 @@ def train(args: argparse.Namespace, experiment) -> dict:
 
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    result = trainer.train()
-    torch.cuda.synchronize()
+    try:
+        result = trainer.train()
+        torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError as error:
+        if not probe:
+            raise
+        result = None
+        failed_at_step = trainer.state.global_step + 1
+        optimizer_stats.record_probe_step(failed_at_step, oom=True)
+        report.update(status="cuda_oom", failed_at_step=failed_at_step, error=str(error))
     seconds = time.perf_counter() - started
-    if not math.isfinite(result.training_loss):
-        raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
     applied = trainer.state.global_step - optimizer_stats.skipped
-    print(f"Optimizer steps: {applied} applied, {optimizer_stats.skipped} skipped; final scale {scaler.get_scale():g}")
-    if not any(torch.count_nonzero(param).item() for name, param in model.named_parameters()
-               if param.requires_grad and ".lora_B." in name):
-        raise RuntimeError("LoRA weights were not updated. Check for skipped FP16 optimizer steps.")
-
     report.update(
         global_step=trainer.state.global_step,
         optimizer_steps_applied=applied,
         optimizer_steps_skipped=optimizer_stats.skipped,
         fp16_final_scale=scaler.get_scale(),
-        train_loss=result.training_loss,
         train_seconds=seconds,
         gpu_hours=seconds / 3600,
-        peak_allocated_gib=torch.cuda.max_memory_allocated() / 1024**3,
+        peak_allocated_gib=max(
+            [torch.cuda.max_memory_allocated() / GIB]
+            + [step["step_peak_allocated_gib"] for step in optimizer_stats.probe_steps]
+        ),
+        peak_reserved_gib=max(
+            [torch.cuda.max_memory_reserved() / GIB]
+            + [step["step_peak_reserved_gib"] for step in optimizer_stats.probe_steps]
+        ),
         log_history=[
             {key: None if isinstance(value, float) and not math.isfinite(value) else value
              for key, value in entry.items()}
             for entry in trainer.state.log_history
         ],
     )
+    if probe:
+        report["batch_probe_steps"] = optimizer_stats.probe_steps
+        if result is None:
+            return report
+
+    if not math.isfinite(result.training_loss):
+        raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
+    print(f"Optimizer steps: {applied} applied, {optimizer_stats.skipped} skipped; final scale {scaler.get_scale():g}")
+    if not any(torch.count_nonzero(param).item() for name, param in model.named_parameters()
+               if param.requires_grad and ".lora_B." in name):
+        raise RuntimeError("LoRA weights were not updated. Check for skipped FP16 optimizer steps.")
+    report.update(status="ok", train_loss=result.training_loss)
+    if probe:
+        return report
+
     model.save_pretrained(args.out_dir / "adapter")
     tokenizer.save_pretrained(args.out_dir / "adapter")
     merged = model.merge_and_unload(safe_merge=True)
     merged.config.use_cache = True
     merged.save_pretrained(args.out_dir / "merged")
     AutoProcessor.from_pretrained(args.model, revision=revision).save_pretrained(args.out_dir / "merged")
-    (args.out_dir / "run.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return report
 
 
@@ -251,12 +308,22 @@ def main() -> None:
     try:
         args.out_dir.mkdir(parents=True, exist_ok=False)
         report = train(args, experiment)
-        print(f"Saved adapter, merged model and run.json to {args.out_dir}")
+        path = args.out_dir / "run.json"
+        path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(f"Saved {path}" if args.batch_probe else f"Saved adapter, merged model and run.json to {args.out_dir}")
         if experiment is not None:
-            experiment.log_metrics(
-                {key: report[key] for key in ("train_seconds", "gpu_hours", "peak_allocated_gib")},
-                step=report["global_step"],
-            )
+            summary = {key: report[key] for key in (
+                "train_seconds", "gpu_hours", "peak_allocated_gib", "peak_reserved_gib",
+            )}
+            if args.batch_probe:
+                summary["fits"] = int(report["status"] == "ok")
+                experiment.log_other("status", report["status"])
+                if report["status"] == "cuda_oom":
+                    experiment.log_other("cuda_oom_error", report["error"])
+            experiment.log_metrics(summary, step=report.get("failed_at_step", report["global_step"]))
+        if report["status"] == "cuda_oom":
+            print(report["error"], file=sys.stderr)
+            sys.exit(BATCH_PROBE_OOM_EXIT)
     finally:
         if experiment is not None:
             experiment.end()
