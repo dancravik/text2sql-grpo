@@ -1,6 +1,6 @@
-"""Тест осуществимости GRPO + LoRA на одной T4: помещается ли шаг в память и сколько он длится.
+"""GRPO + LoRA на одной GPU: короткий замер или обучение с экспортом модели.
 
-Это не обучение: несколько шагов GRPO на небольшой выборке Spider train. Один шаг =
+По умолчанию это короткий замер на небольшой выборке Spider train. Один шаг =
 prompts_per_step вопросов × num_generations ответов: генерация, награда, forward/backward
 и шаг оптимизатора. Первый шаг — прогрев, в средние не входит.
 
@@ -12,8 +12,8 @@ prompts_per_step вопросов × num_generations ответов: генер�
 - шаг оптимизатора = gradient_accumulation_steps микробатчей, генерация — раз в шаг
   (steps_per_generation по умолчанию равен gradient_accumulation_steps).
 
-Qwen3.5 мультимодальная: без vLLM грузим только языковую часть (Qwen3_5ForCausalLM), с vLLM colocate —
-модель целиком, иначе trl не сможет синхронизировать веса в vLLM (см. load_model).
+Qwen3.5 мультимодальная: для замера через Transformers грузим только языковую
+часть (Qwen3_5ForCausalLM). Для vLLM colocate и экспорта берём полную архитектуру.
 
 Запуск (из корня репозитория, одна GPU):
     CUDA_VISIBLE_DEVICES=0 DATA_DIR=/kaggle/input/<dataset> \
@@ -24,6 +24,7 @@ import argparse
 import importlib.metadata
 import importlib.util
 import json
+import math
 import random
 import sys
 import time
@@ -40,9 +41,11 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     PreTrainedModel,
     TrainerCallback,
+    set_seed,
 )
 from trl import GRPOConfig, GRPOTrainer
 
@@ -62,7 +65,8 @@ VISION_MARKERS = ("visual", "vision")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", required=True, help="Hugging Face model ID or a merged checkpoint directory")
+    p.add_argument("--revision", help="Hugging Face revision for the starting model and tokenizer")
     p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
     p.add_argument("--num-questions", type=int, default=64)
     p.add_argument("--num-generations", type=int, default=8)
@@ -90,12 +94,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="results/feasibility")
+    p.add_argument("--export-model", action="store_true", help="Save the LoRA adapter and merged model")
+    p.add_argument("--fp16-init-scale", type=float, default=128.0, help="Initial dynamic loss scale for export runs")
     p.add_argument("--smoke", action="store_true", help="max_steps=2")
     args = p.parse_args()
     if args.smoke:
         args.max_steps = 2
     if args.micro_batch_size is None:
         args.micro_batch_size = args.num_generations
+    for name in ("num_questions", "prompts_per_step", "micro_batch_size", "max_steps", "max_completion_length"):
+        if getattr(args, name) < 1:
+            p.error(f"--{name.replace('_', '-')} must be positive")
+    if args.num_generations < 2:
+        p.error("--num-generations must be at least 2")
+    if not math.isfinite(args.fp16_init_scale) or args.fp16_init_scale <= 0:
+        p.error("--fp16-init-scale must be positive and finite")
+    if args.export_model and Path(args.out_dir).exists():
+        p.error(f"Output already exists: {args.out_dir}. Pick a new directory for the exported run.")
     completions_per_step = args.prompts_per_step * args.num_generations
     if completions_per_step % args.micro_batch_size != 0:
         p.error(f"prompts_per_step * num_generations ({completions_per_step}) must be divisible by --micro-batch-size")
@@ -156,10 +171,10 @@ def sql_reward(
     ]
 
 
-def load_model(model_id: str, text_only: bool) -> tuple[PreTrainedModel, dict]:
+def load_model(model_id: str, text_only: bool, revision: str | None) -> tuple[PreTrainedModel, dict]:
     """fp16 + sdpa. Мультимодальную модель при text_only грузим без энкодера изображений."""
-    kwargs = {"dtype": torch.float16, "attn_implementation": "sdpa"}
-    multimodal = getattr(AutoConfig.from_pretrained(model_id), "vision_config", None) is not None
+    kwargs = {"dtype": torch.float16, "attn_implementation": "sdpa", "revision": revision}
+    multimodal = getattr(AutoConfig.from_pretrained(model_id, revision=revision), "vision_config", None) is not None
     load_note = None
     if not multimodal:
         model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
@@ -173,7 +188,7 @@ def load_model(model_id: str, text_only: bool) -> tuple[PreTrainedModel, dict]:
     else:
         # trl синхронизирует веса в vLLM по именам, а vLLM поднимает мультимодальную архитектуру:
         # имена текстовой модели (model.layers.*) его маппер не знает, нужны model.language_model.*
-        load_note = "loaded full multimodal model: vLLM colocate weight sync needs multimodal parameter names"
+        load_note = "loaded full multimodal architecture for vLLM compatibility"
         model = AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
     model.to("cuda")
 
@@ -182,6 +197,7 @@ def load_model(model_id: str, text_only: bool) -> tuple[PreTrainedModel, dict]:
     )
     info = {
         "model_class": type(model).__name__,
+        "initial_revision": getattr(model.config, "_commit_hash", None) or revision,
         "multimodal_checkpoint": multimodal,
         "text_only_loaded": vision_params == 0,
         "vision_params": vision_params,
@@ -200,6 +216,7 @@ def add_lora(model: PreTrainedModel, args: argparse.Namespace, has_vision: bool)
         target_modules="all-linear",
         exclude_modules=r".*(visual|vision).*" if has_vision else None,
         task_type="CAUSAL_LM",
+        revision=getattr(model.config, "_commit_hash", None) or args.revision,
     )
     # autocast_adapter_dtype=True (по умолчанию) держит веса LoRA в fp32 поверх fp16-модели,
     # без этого GradScaler при fp16=True падает на fp16-градиентах
@@ -220,7 +237,13 @@ class StepStats(TrainerCallback):
 
     def __init__(self) -> None:
         self.steps: list[dict] = []
+        self.optimizer_steps_skipped = 0
+        self.accelerator = None
         self._t0 = 0.0
+
+    def on_optimizer_step(self, args, state, control, **kwargs) -> None:
+        if self.accelerator is not None:
+            self.optimizer_steps_skipped += int(self.accelerator.optimizer_step_was_skipped)
 
     def on_step_begin(self, args, state, control, **kwargs) -> None:
         torch.cuda.synchronize()
@@ -264,6 +287,9 @@ def summarize(steps: list[dict]) -> dict:
         "peak_reserved_gb": max((s["peak_reserved_gb"] for s in steps), default=None),
         "mean_step_time_s": mean([s["time_s"] for s in measured]),
         "mean_reward": mean([s["reward"] for s in measured if s.get("reward") is not None]),
+        "mean_frac_reward_zero_std": mean(
+            [s["frac_reward_zero_std"] for s in measured if s.get("frac_reward_zero_std") is not None]
+        ),
         "mean_completion_length": mean(
             [s["completions/mean_length"] for s in measured if s.get("completions/mean_length") is not None]
         ),
@@ -281,7 +307,8 @@ def error_status(e: BaseException) -> str:
 
 def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     """Загрузка модели, LoRA, GRPOTrainer и обучение на max_steps шагов; заполняет report."""
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    set_seed(args.seed)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     dataset, prompt_lens = build_dataset(tokenizer, args)
     report["manifest_sha256"] = sha256_file(Path(args.manifest))
     report["train_example_ids"] = list(dataset["example_id"])
@@ -289,7 +316,12 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["prompt_tokens_max"] = max(prompt_lens)
     print(f"Dataset: {len(dataset)} prompts, tokens mean {report['prompt_tokens_mean']:.0f}, max {max(prompt_lens)}")
 
-    model, info = load_model(args.model, text_only=args.use_vllm == "none")
+    # Retain Qwen's full architecture for the checkpoint consumed by evaluate.py.
+    model, info = load_model(
+        args.model,
+        text_only=args.use_vllm == "none" and not args.export_model,
+        revision=args.revision,
+    )
     report.update(info)
     model = add_lora(model, args, has_vision=info["vision_params"] > 0)
     trainable, total = model.get_nb_trainable_parameters()
@@ -315,9 +347,11 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         bf16=False,
         gradient_checkpointing=True,
         logging_steps=1,
+        logging_nan_inf_filter=not args.export_model,
         save_strategy="no",
         report_to="none",
         seed=args.seed,
+        data_seed=args.seed,
         use_vllm=args.use_vllm == "colocate",
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
@@ -339,7 +373,43 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     )
     report["memory_after_init_gb"] = torch.cuda.memory_allocated() / GB
     print(f"Memory after init: {report['memory_after_init_gb']:.2f} GB")
-    trainer.train()
+    stats.accelerator = trainer.accelerator
+    if args.export_model:
+        scaler = trainer.accelerator.scaler
+        if scaler is None:
+            raise RuntimeError("Expected an active FP16 gradient scaler")
+        scale_state = scaler.state_dict()
+        scale_state["scale"] = args.fp16_init_scale
+        scaler.load_state_dict(scale_state)
+
+    started = time.perf_counter()
+    result = trainer.train()
+    torch.cuda.synchronize()
+    report["train_seconds"] = time.perf_counter() - started
+    report["gpu_hours"] = report["train_seconds"] / 3600
+    report["optimizer_steps_applied"] = trainer.state.global_step - stats.optimizer_steps_skipped
+    if not args.export_model:
+        return
+
+    if not math.isfinite(result.training_loss):
+        raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
+    if report["optimizer_steps_applied"] < 1 or not any(
+        torch.count_nonzero(param).item()
+        for name, param in model.named_parameters()
+        if param.requires_grad and ".lora_B." in name
+    ):
+        raise RuntimeError("LoRA weights were not updated")
+    report["train_loss"] = result.training_loss
+
+    out_dir = Path(args.out_dir)
+    model.save_pretrained(out_dir / "adapter")
+    tokenizer.save_pretrained(out_dir / "adapter")
+    merged = model.to("cpu").merge_and_unload(safe_merge=True)
+    merged.config.use_cache = True
+    merged.save_pretrained(out_dir / "merged")
+    tokenizer.save_pretrained(out_dir / "merged")
+    if info["multimodal_checkpoint"]:
+        AutoProcessor.from_pretrained(args.model, revision=info["initial_revision"]).save_pretrained(out_dir / "merged")
 
 
 def main() -> None:
@@ -350,7 +420,7 @@ def main() -> None:
         sys.exit(f"Expected exactly one visible GPU, got {torch.cuda.device_count()}: set CUDA_VISIBLE_DEVICES=0")
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=not args.export_model)
     name = f"{args.model.split('/')[-1]}_{args.use_vllm}"
     name += "_sleep" if args.use_vllm == "colocate" and args.vllm_sleep else ""
     name += "_think" if args.enable_thinking == "on" else ""
@@ -376,7 +446,8 @@ def main() -> None:
 
     report.update(summarize(stats.steps))
     report["steps"] = stats.steps
-    path = out_dir / f"{name}.json"
+    report["optimizer_steps_skipped"] = stats.optimizer_steps_skipped
+    path = out_dir / ("run.json" if args.export_model else f"{name}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
@@ -384,11 +455,13 @@ def main() -> None:
     for key in (
         "status", "model_class", "text_only_loaded", "num_params", "trainable_params",
         "peak_memory_gb", "peak_reserved_gb", "mean_step_time_s", "mean_reward",
-        "mean_completion_length", "steps_done",
+        "mean_frac_reward_zero_std", "mean_completion_length", "steps_done",
     ):
         value = report.get(key)
         print(f"{key:24}{value:.3f}" if isinstance(value, float) else f"{key:24}{value}")
     print(f"Saved to {path}")
+    if args.export_model and report["status"] != "ok":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

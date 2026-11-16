@@ -13,12 +13,14 @@ if TYPE_CHECKING:
     from vllm import LLM
 
 
-def load_llm(model_id: str, max_model_len: int, seed: int) -> "LLM":
+def load_llm(model_id: str, max_model_len: int, seed: int, revision: str | None = None) -> "LLM":
     """vLLM-модель в fp16 (T4 не поддерживает bf16)."""
     from vllm import LLM
 
     return LLM(
         model=model_id,
+        revision=revision,
+        tokenizer_revision=revision,
         dtype="half",
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,
