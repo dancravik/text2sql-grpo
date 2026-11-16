@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--fp16-init-scale", type=float, default=128.0,
+                        help="Initial dynamic loss scale for FP16 on T4")
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=100)
     duration = parser.add_mutually_exclusive_group()
@@ -49,8 +51,10 @@ def parse_args() -> argparse.Namespace:
         args.micro_batch_size = 1
         args.grad_accum = 4
         args.logging_steps = 1
+        args.warmup_ratio = 0.0
     for name in ("num_train_examples", "lora_r", "lora_alpha", "micro_batch_size", "grad_accum",
-                 "max_length", "logging_steps", "save_steps", "max_steps", "epochs", "learning_rate"):
+                 "max_length", "logging_steps", "save_steps", "max_steps", "epochs", "learning_rate",
+                 "fp16_init_scale"):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -130,11 +134,18 @@ def train(args: argparse.Namespace, experiment) -> dict:
     if {param.dtype for param in trainable} != {torch.float32}:
         raise RuntimeError("FP16 training requires FP32 LoRA parameters")
 
-    class CometCallback(TrainerCallback):
+    class OptimizerStats(TrainerCallback):
+        skipped = 0
+
+        def on_optimizer_step(self, args, state, control, **kwargs):
+            self.skipped += int(trainer.accelerator.optimizer_step_was_skipped)
+
         def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs:
+            if experiment is not None and logs:
                 metrics = {name: value for name, value in logs.items()
                            if isinstance(value, (int, float)) and math.isfinite(value)}
+                metrics["optimizer_steps_skipped"] = self.skipped
+                metrics["fp16_loss_scale"] = trainer.accelerator.scaler.get_scale()
                 experiment.log_metrics(metrics, step=state.global_step)
 
     config = TrainingArguments(
@@ -162,14 +173,22 @@ def train(args: argparse.Namespace, experiment) -> dict:
         label_names=["labels"],
         report_to="none",
     )
+    optimizer_stats = OptimizerStats()
     trainer = Trainer(
         model=model,
         args=config,
         train_dataset=dataset,
         data_collator=partial(collate_batch, tokenizer),
         processing_class=tokenizer,
-        callbacks=[CometCallback()] if experiment is not None else [],
+        callbacks=[optimizer_stats],
     )
+    scaler = trainer.accelerator.scaler
+    if scaler is None:
+        raise RuntimeError("Expected an active FP16 gradient scaler")
+    # Configure before the first backward pass. Keep dynamic overflow handling enabled.
+    scale_state = scaler.state_dict()
+    scale_state["scale"] = args.fp16_init_scale
+    scaler.load_state_dict(scale_state)
     report = {
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "base_revision": revision,
@@ -195,12 +214,17 @@ def train(args: argparse.Namespace, experiment) -> dict:
     seconds = time.perf_counter() - started
     if not math.isfinite(result.training_loss):
         raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
+    applied = trainer.state.global_step - optimizer_stats.skipped
+    print(f"Optimizer steps: {applied} applied, {optimizer_stats.skipped} skipped; final scale {scaler.get_scale():g}")
     if not any(torch.count_nonzero(param).item() for name, param in model.named_parameters()
                if param.requires_grad and ".lora_B." in name):
         raise RuntimeError("LoRA weights were not updated. Check for skipped FP16 optimizer steps.")
 
     report.update(
         global_step=trainer.state.global_step,
+        optimizer_steps_applied=applied,
+        optimizer_steps_skipped=optimizer_stats.skipped,
+        fp16_final_scale=scaler.get_scale(),
         train_loss=result.training_loss,
         train_seconds=seconds,
         gpu_hours=seconds / 3600,
