@@ -56,6 +56,7 @@ from data import DATA_DIR  # noqa: E402
 from prompt import render_prompt  # noqa: E402
 from reward import reward  # noqa: E402
 from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
+from comet_tracking import start_experiment  # noqa: E402
 
 GB = 1024**3
 # Ключи из логов trl, которые сохраняем по каждому шагу
@@ -95,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="results/feasibility")
     p.add_argument("--export-model", action="store_true", help="Save the LoRA adapter and merged model")
+    p.add_argument("--full-model", action="store_true", help="Use the export-compatible full architecture during memory probes")
+    p.add_argument("--comet", action="store_true")
+    p.add_argument("--name", help="Unique experiment name, including the starting branch and probe stage")
+    p.add_argument("--branch", choices=["base_grpo", "sft_grpo"], default="base_grpo")
     p.add_argument("--fp16-init-scale", type=float, default=128.0, help="Initial dynamic loss scale for export runs")
     p.add_argument("--smoke", action="store_true", help="max_steps=2")
     args = p.parse_args()
@@ -235,7 +240,8 @@ def linear_attn_kernels() -> dict[str, bool]:
 class StepStats(TrainerCallback):
     """Время и пиковая память каждого шага оптимизатора, награда и длина ответа из логов trl."""
 
-    def __init__(self) -> None:
+    def __init__(self, experiment=None) -> None:
+        self.experiment = experiment
         self.steps: list[dict] = []
         self.optimizer_steps_skipped = 0
         self.accelerator = None
@@ -262,6 +268,12 @@ class StepStats(TrainerCallback):
         })
 
     def on_log(self, args, state, control, logs=None, **kwargs) -> None:
+        if self.experiment is not None and logs:
+            metrics = {k: v for k, v in logs.items() if isinstance(v, (int, float)) and math.isfinite(v)}
+            if self.steps:
+                metrics.update(self.steps[-1])
+            metrics["optimizer_steps_skipped"] = self.optimizer_steps_skipped
+            self.experiment.log_metrics(metrics, step=state.global_step)
         # on_log вызывается после on_step_end того же шага (logging_steps=1)
         if not logs or not self.steps or "reward" not in logs:
             return
@@ -319,7 +331,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     # Retain Qwen's full architecture for the checkpoint consumed by evaluate.py.
     model, info = load_model(
         args.model,
-        text_only=args.use_vllm == "none" and not args.export_model,
+        text_only=args.use_vllm == "none" and not args.export_model and not args.full_model,
         revision=args.revision,
     )
     report.update(info)
@@ -374,13 +386,12 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["memory_after_init_gb"] = torch.cuda.memory_allocated() / GB
     print(f"Memory after init: {report['memory_after_init_gb']:.2f} GB")
     stats.accelerator = trainer.accelerator
-    if args.export_model:
-        scaler = trainer.accelerator.scaler
-        if scaler is None:
-            raise RuntimeError("Expected an active FP16 gradient scaler")
-        scale_state = scaler.state_dict()
-        scale_state["scale"] = args.fp16_init_scale
-        scaler.load_state_dict(scale_state)
+    scaler = trainer.accelerator.scaler
+    if scaler is None:
+        raise RuntimeError("Expected an active FP16 gradient scaler")
+    scale_state = scaler.state_dict()
+    scale_state["scale"] = args.fp16_init_scale
+    scaler.load_state_dict(scale_state)
 
     started = time.perf_counter()
     result = trainer.train()
@@ -388,6 +399,13 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["train_seconds"] = time.perf_counter() - started
     report["gpu_hours"] = report["train_seconds"] / 3600
     report["optimizer_steps_applied"] = trainer.state.global_step - stats.optimizer_steps_skipped
+    report["log_history"] = trainer.state.log_history
+    report["fp16_final_scale"] = scaler.get_scale()
+    if report["optimizer_steps_applied"] < 1:
+        raise RuntimeError("No optimizer updates were applied")
+    if not math.isfinite(result.training_loss):
+        raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
+    report["train_loss"] = result.training_loss
     if not args.export_model:
         return
 
@@ -434,7 +452,11 @@ def main() -> None:
         "args": vars(args),
         "linear_attn_kernels": linear_attn_kernels(),
     }
-    stats = StepStats()
+    experiment = start_experiment(name=args.name or out_dir.name) if args.comet else None
+    if experiment is not None:
+        report["comet_experiment_key"] = experiment.get_key()
+        experiment.log_parameters({**vars(args), "versions": vers})
+    stats = StepStats(experiment)
     try:
         run(args, report, stats)
         report["status"] = "ok"
@@ -460,7 +482,19 @@ def main() -> None:
         value = report.get(key)
         print(f"{key:24}{value:.3f}" if isinstance(value, float) else f"{key:24}{value}")
     print(f"Saved to {path}")
-    if args.export_model and report["status"] != "ok":
+    if experiment is not None:
+        try:
+            experiment.log_metrics({
+                "fits": int(report["status"] == "ok"),
+                "cuda_oom": int(report["status"].startswith("CUDA OOM")),
+                "optimizer_steps_skipped": stats.optimizer_steps_skipped,
+                **{k: v for k, v in report.items() if isinstance(v, (int, float)) and math.isfinite(v)},
+            })
+            experiment.log_other("status", report["status"])
+            experiment.log_asset(str(path))
+        finally:
+            experiment.end()
+    if report["status"] != "ok":
         sys.exit(1)
 
 
