@@ -57,6 +57,7 @@ from prompt import render_prompt  # noqa: E402
 from reward import reward  # noqa: E402
 from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
 from comet_tracking import start_experiment  # noqa: E402
+from train_sft import upload_training_bundle  # noqa: E402
 
 GB = 1024**3
 # Ключи из логов trl, которые сохраняем по каждому шагу
@@ -98,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default="results/feasibility")
     p.add_argument("--export-model", action="store_true", help="Save the LoRA adapter and merged model")
+    p.add_argument("--save-adapter", action="store_true", help="Save adapter and run.json without merging the base model")
     p.add_argument("--full-model", action="store_true", help="Use the export-compatible full architecture during memory probes")
     p.add_argument("--comet", action="store_true")
     p.add_argument("--name", help="Unique experiment name, including the starting branch and probe stage")
@@ -116,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         p.error("--num-generations must be at least 2")
     if not math.isfinite(args.fp16_init_scale) or args.fp16_init_scale <= 0:
         p.error("--fp16-init-scale must be positive and finite")
-    if args.export_model and Path(args.out_dir).exists():
+    if (args.export_model or args.save_adapter) and Path(args.out_dir).exists():
         p.error(f"Output already exists: {args.out_dir}. Pick a new directory for the exported run.")
     completions_per_step = args.prompts_per_step * args.num_generations
     if completions_per_step % args.micro_batch_size != 0:
@@ -339,7 +341,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     # Retain Qwen's full architecture for the checkpoint consumed by evaluate.py.
     model, info = load_model(
         args.model,
-        text_only=args.use_vllm == "none" and not args.export_model and not args.full_model,
+        text_only=args.use_vllm == "none" and not args.export_model and not args.save_adapter and not args.full_model,
         revision=args.revision,
     )
     report.update(info)
@@ -415,7 +417,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     if not math.isfinite(result.training_loss):
         raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
     report["train_loss"] = result.training_loss
-    if not args.export_model:
+    if not (args.export_model or args.save_adapter):
         return
 
     if not math.isfinite(result.training_loss):
@@ -431,12 +433,17 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     out_dir = Path(args.out_dir)
     model.save_pretrained(out_dir / "adapter")
     tokenizer.save_pretrained(out_dir / "adapter")
+    report["export_status"] = "pending" if args.export_model else "adapter_only"
+    (out_dir / "run.json").write_text(json.dumps(report, indent=2) + "\n")
+    if not args.export_model:
+        return
     merged = model.to("cpu").merge_and_unload(safe_merge=True)
     merged.config.use_cache = True
     merged.save_pretrained(out_dir / "merged")
     tokenizer.save_pretrained(out_dir / "merged")
     if info["multimodal_checkpoint"]:
         AutoProcessor.from_pretrained(args.model, revision=info["initial_revision"]).save_pretrained(out_dir / "merged")
+    report["export_status"] = "ok"
 
 
 def main() -> None:
@@ -447,7 +454,7 @@ def main() -> None:
         sys.exit(f"Expected exactly one visible GPU, got {torch.cuda.device_count()}: set CUDA_VISIBLE_DEVICES=0")
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=not args.export_model)
+    out_dir.mkdir(parents=True, exist_ok=not (args.export_model or args.save_adapter))
     name = f"{args.model.split('/')[-1]}_{args.use_vllm}"
     name += "_sleep" if args.use_vllm == "colocate" and args.vllm_sleep else ""
     name += "_think" if args.enable_thinking == "on" else ""
@@ -478,7 +485,7 @@ def main() -> None:
     report.update(summarize(stats.steps))
     report["steps"] = stats.steps
     report["optimizer_steps_skipped"] = stats.optimizer_steps_skipped
-    path = out_dir / ("run.json" if args.export_model else f"{name}.json")
+    path = out_dir / ("run.json" if args.export_model or args.save_adapter else f"{name}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
@@ -501,6 +508,12 @@ def main() -> None:
             })
             experiment.log_other("status", report["status"])
             experiment.log_asset(str(path))
+            if (args.save_adapter or args.export_model) and (out_dir / "adapter").is_dir():
+                upload_training_bundle(
+                    experiment, out_dir / "adapter", out_dir / "grpo_adapter.zip",
+                    step=len(stats.steps),
+                    extra_files=[(path, "run.json"), (Path(args.manifest), "splits/v1.json")],
+                )
         finally:
             experiment.end()
     if report["status"] != "ok":
