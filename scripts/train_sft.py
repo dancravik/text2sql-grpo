@@ -8,6 +8,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -20,6 +21,25 @@ from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
 IGNORE_INDEX = -100
 GIB = 1024**3
 BATCH_PROBE_OOM_EXIT = 3
+
+
+def upload_training_bundle(experiment, folder: Path, archive: Path, *, step: int,
+                           extra_files=()) -> bool:
+    """Upload a recoverable snapshot, retaining the local ZIP on upload timeout."""
+    with ZipFile(archive, "w", ZIP_DEFLATED, allowZip64=True) as bundle:
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                bundle.write(path, folder.name + "/" + path.relative_to(folder).as_posix())
+        for path, name in extra_files:
+            bundle.write(path, name)
+    experiment.log_asset(str(archive), file_name=archive.name, copy_to_tmp=False, step=step)
+    delivered = experiment.flush(timeout=300)
+    if delivered:
+        archive.unlink()
+        print(f"Comet confirmed backup: {archive.name}", flush=True)
+    else:
+        print(f"WARNING: Comet backup not confirmed; local ZIP retained: {archive}", flush=True)
+    return delivered
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     duration.add_argument("--smoke", action="store_true", help="8 steps, 64 train examples, batch 1 x 4")
     parser.add_argument("--batch-probe", action="store_true", help="Measure training memory without exporting a model")
     parser.add_argument("--comet", action="store_true", help="Track this run using COMET_API_KEY")
+    parser.add_argument("--comet-checkpoints", action="store_true", help="Upload resumable checkpoints and the final adapter to Comet")
+    parser.add_argument("--resume-from-checkpoint", type=Path, help="Resume into a new output directory from an extracted Trainer checkpoint")
     args = parser.parse_args()
     if args.batch_probe and args.max_steps is None:
         parser.error("--batch-probe requires an explicit --max-steps")
@@ -69,6 +91,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup-ratio must be in [0, 1)")
     if args.out_dir.exists():
         parser.error(f"Output already exists: {args.out_dir}. Pick a new directory for each trial.")
+    if args.comet_checkpoints and (not args.comet or args.save_strategy == "no" or args.batch_probe):
+        parser.error("--comet-checkpoints requires --comet and checkpoint saving outside batch probes")
+    if args.resume_from_checkpoint is not None and not (args.resume_from_checkpoint / "run_progress.json").is_file():
+        parser.error("Resume checkpoint must contain run_progress.json from a saved Comet checkpoint")
     return args
 
 
@@ -184,6 +210,21 @@ def train(args: argparse.Namespace, experiment) -> dict:
                     metrics["peak_reserved_gib_so_far"] = torch.cuda.max_memory_reserved() / GIB
                 experiment.log_metrics(metrics, step=state.global_step)
 
+        def on_save(self, training_args, state, control, **kwargs):
+            checkpoint = Path(training_args.output_dir) / f"checkpoint-{state.global_step}"
+            progress = dict(report)
+            progress.update(status="training", global_step=state.global_step,
+                            optimizer_steps_skipped=self.skipped, log_history=state.log_history)
+            (checkpoint / "run_progress.json").write_text(
+                json.dumps(progress, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+            )
+            if args.comet_checkpoints:
+                upload_training_bundle(
+                    experiment, checkpoint, args.out_dir / f"checkpoint-{state.global_step}.zip",
+                    step=state.global_step,
+                    extra_files=[(args.manifest, "splits/v1.json")],
+                )
+
     probe = args.batch_probe
     config = TrainingArguments(
         output_dir=str(args.out_dir / "checkpoints"),
@@ -245,10 +286,23 @@ def train(args: argparse.Namespace, experiment) -> dict:
                                          "effective_batch_size", "trainable_params", "gpu")
         })
 
+    if args.resume_from_checkpoint is not None:
+        previous = json.loads((args.resume_from_checkpoint / "run_progress.json").read_text())
+        for key in ("base_revision", "manifest_sha256", "train_example_ids"):
+            if previous[key] != report[key]:
+                raise ValueError(f"Resume mismatch: {key}")
+        for key in ("model", "learning_rate", "lora_r", "lora_alpha", "micro_batch_size", "grad_accum",
+                    "max_length", "warmup_ratio", "seed", "epochs", "max_steps"):
+            if previous["args"][key] != report["args"][key]:
+                raise ValueError(f"Resume configuration mismatch: {key}")
+        optimizer_stats.skipped = previous.get("optimizer_steps_skipped", 0)
+    report["status"] = "training"
+    (args.out_dir / "run.json").write_text(json.dumps(report, indent=2) + "\n")
+
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     try:
-        result = trainer.train()
+        result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint)) if args.resume_from_checkpoint else trainer.train()
         torch.cuda.synchronize()
     except torch.cuda.OutOfMemoryError as error:
         if not probe:
@@ -302,6 +356,12 @@ def train(args: argparse.Namespace, experiment) -> dict:
     (args.out_dir / "run.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )
+    if args.comet_checkpoints:
+        upload_training_bundle(
+            experiment, args.out_dir / "adapter", args.out_dir / "final_adapter.zip",
+            step=trainer.state.global_step,
+            extra_files=[(args.out_dir / "run.json", "run.json"), (args.manifest, "splits/v1.json")],
+        )
     merged = model.merge_and_unload(safe_merge=True)
     merged.config.use_cache = True
     merged.save_pretrained(args.out_dir / "merged")
@@ -312,7 +372,10 @@ def train(args: argparse.Namespace, experiment) -> dict:
 
 def main() -> None:
     args = parse_args()
-    experiment = start_experiment(name=args.out_dir.name) if args.comet else None
+    resume_key = None
+    if args.comet and args.resume_from_checkpoint is not None:
+        resume_key = json.loads((args.resume_from_checkpoint / "run_progress.json").read_text()).get("comet_experiment_key")
+    experiment = start_experiment(name=args.out_dir.name, key=resume_key) if args.comet else None
     try:
         args.out_dir.mkdir(parents=True, exist_ok=False)
         report = train(args, experiment)
@@ -329,6 +392,7 @@ def main() -> None:
                 if report["status"] == "cuda_oom":
                     experiment.log_other("cuda_oom_error", report["error"])
             experiment.log_metrics(summary, step=report.get("failed_at_step", report["global_step"]))
+            experiment.log_asset(str(path), file_name="run.json", overwrite=True)
         if report["status"] == "cuda_oom":
             print(report["error"], file=sys.stderr)
             sys.exit(BATCH_PROBE_OOM_EXIT)
