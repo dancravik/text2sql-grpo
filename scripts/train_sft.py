@@ -41,6 +41,8 @@ def parse_args() -> argparse.Namespace:
                         help="Initial dynamic loss scale for FP16 on T4")
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=100)
+    parser.add_argument("--save-strategy", choices=("steps", "no"), default="steps",
+                        help="Use no for short pilots to save disk space")
     duration = parser.add_mutually_exclusive_group()
     duration.add_argument("--epochs", type=float, default=1.0)
     duration.add_argument("--max-steps", type=int)
@@ -200,7 +202,7 @@ def train(args: argparse.Namespace, experiment) -> dict:
         logging_steps=args.logging_steps,
         logging_first_step=True,
         logging_nan_inf_filter=False,
-        save_strategy="no" if probe else "steps",
+        save_strategy="no" if probe else args.save_strategy,
         save_steps=args.save_steps,
         save_total_limit=2,
         seed=args.seed,
