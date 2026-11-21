@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--revision", help="Hugging Face revision for the starting model and tokenizer")
     p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
     p.add_argument("--num-questions", type=int, default=64)
+    p.add_argument("--sample-policy", choices=["random", "longest"], default="random")
     p.add_argument("--num-generations", type=int, default=8)
     p.add_argument("--prompts-per-step", type=int, default=4)
     p.add_argument(
@@ -81,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lr", type=float, default=5e-6)
+    p.add_argument("--lr-scheduler-type", choices=["linear", "constant"], default="linear")
     p.add_argument("--beta", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=0.8, help="как в probe_models.py")
     p.add_argument("--enable-thinking", choices=["on", "off"], default="off")
@@ -140,7 +142,8 @@ def versions() -> dict[str, str | None]:
 def build_dataset(tokenizer, args: argparse.Namespace) -> tuple[Dataset, list[int]]:
     """Готовые промпты из render_prompt + поля для награды; возвращает датасет и длины промптов."""
     examples = load_split("train", DATA_DIR, Path(args.manifest))
-    examples = random.Random(args.seed).sample(examples, min(args.num_questions, len(examples)))
+    if args.sample_policy == "random":
+        examples = random.Random(args.seed).sample(examples, min(args.num_questions, len(examples)))
     enable_thinking = args.enable_thinking == "on"
 
     rows, prompt_lens = [], []
@@ -159,6 +162,10 @@ def build_dataset(tokenizer, args: argparse.Namespace) -> tuple[Dataset, list[in
             "gold_sql": ex["gold_sql"],
             "db_path": ex["db_path"],
         })
+    if args.sample_policy == "longest":
+        selected = sorted(zip(prompt_lens, rows), key=lambda item: (-item[0], item[1]["example_id"]))[:args.num_questions]
+        prompt_lens = [length for length, _ in selected]
+        rows = [row for _, row in selected]
     return Dataset.from_list(rows), prompt_lens
 
 
@@ -325,6 +332,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["manifest_sha256"] = sha256_file(Path(args.manifest))
     report["train_example_ids"] = list(dataset["example_id"])
     report["prompt_tokens_mean"] = sum(prompt_lens) / len(prompt_lens)
+    report["prompt_tokens_min"] = min(prompt_lens)
     report["prompt_tokens_max"] = max(prompt_lens)
     print(f"Dataset: {len(dataset)} prompts, tokens mean {report['prompt_tokens_mean']:.0f}, max {max(prompt_lens)}")
 
@@ -348,6 +356,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         output_dir=str(Path(args.out_dir) / "trainer"),
         max_steps=args.max_steps,
         learning_rate=args.lr,
+        lr_scheduler_type=args.lr_scheduler_type,
         # Шаг оптимизатора = grad_accum микробатчей = prompts_per_step групп по num_generations ответов
         per_device_train_batch_size=args.micro_batch_size,
         gradient_accumulation_steps=grad_accum,
