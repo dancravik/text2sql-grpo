@@ -4,6 +4,15 @@ import os
 from pathlib import Path
 
 
+def training_step(report: dict) -> int:
+    """Read the optimizer step from current reports or legacy GRPO reports."""
+    for key in ("global_step", "steps_done"):
+        value = report.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    raise ValueError("Training report has no valid global_step or legacy steps_done")
+
+
 def start_experiment(*, name: str | None = None, key: str | None = None):
     from dotenv import load_dotenv
 

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from data import DATA_DIR  # noqa: E402
-from comet_tracking import start_experiment  # noqa: E402
+from comet_tracking import start_experiment, training_step  # noqa: E402
 from prompt import render_prompt  # noqa: E402
 from reward import compare, execute  # noqa: E402
 from sampling import load_llm, sample_and_score  # noqa: E402
@@ -175,6 +175,7 @@ def main() -> None:
     training_run = None
     if args.comet_run is not None:
         training_run = json.loads(args.comet_run.read_text(encoding="utf-8"))
+        training_step(training_run)  # Validate metadata before allocating GPU memory.
         if not training_run.get("comet_experiment_key"):
             raise ValueError("The SFT run has no Comet experiment. Train with --comet first.")
         if training_run["manifest_sha256"] != manifest_sha:
@@ -252,7 +253,7 @@ def main() -> None:
                 experiment.log_metrics(
                     {f"{prefix}{dataset}/{name}": value for name, value in metrics.items()
                      if isinstance(value, (int, float))},
-                    step=training_run["global_step"],
+                    step=training_step(training_run),
                 )
         finally:
             experiment.end()

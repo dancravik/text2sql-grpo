@@ -410,6 +410,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["train_seconds"] = time.perf_counter() - started
     report["gpu_hours"] = report["train_seconds"] / 3600
     report["optimizer_steps_applied"] = trainer.state.global_step - stats.optimizer_steps_skipped
+    report["global_step"] = trainer.state.global_step
     report["log_history"] = trainer.state.log_history
     report["fp16_final_scale"] = scaler.get_scale()
     if report["optimizer_steps_applied"] < 1:
