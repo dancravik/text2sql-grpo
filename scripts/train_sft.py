@@ -295,10 +295,16 @@ def train(args: argparse.Namespace, experiment) -> dict:
 
     model.save_pretrained(args.out_dir / "adapter")
     tokenizer.save_pretrained(args.out_dir / "adapter")
+    # Preserve completed training even if exporting the larger merged model fails.
+    report["export_status"] = "pending"
+    (args.out_dir / "run.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
     merged = model.merge_and_unload(safe_merge=True)
     merged.config.use_cache = True
     merged.save_pretrained(args.out_dir / "merged")
     AutoProcessor.from_pretrained(args.model, revision=revision).save_pretrained(args.out_dir / "merged")
+    report["export_status"] = "ok"
     return report
 
 
