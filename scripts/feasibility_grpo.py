@@ -106,11 +106,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--branch", choices=["base_grpo", "sft_grpo"], default="base_grpo")
     p.add_argument("--init-sft-run", help="Completed SFT run containing run.json and adapter/")
     p.add_argument("--save-steps", type=int, default=0, help="Upload intermediate adapter snapshots to Comet; 0 disables")
+    p.add_argument("--keep-checkpoints", type=int, default=2)
     p.add_argument("--fp16-init-scale", type=float, default=128.0, help="Initial dynamic loss scale for export runs")
     p.add_argument("--smoke", action="store_true", help="max_steps=2")
     args = p.parse_args()
     if (args.branch == "sft_grpo") != bool(args.init_sft_run):
         p.error("Use --branch sft_grpo together with --init-sft-run")
+    if args.keep_checkpoints < 1:
+        p.error("--keep-checkpoints must be positive")
     if args.save_steps < 0 or (args.save_steps and not args.comet):
         p.error("--save-steps must be nonnegative and requires --comet")
     if args.smoke:
@@ -263,12 +266,22 @@ class StepStats(TrainerCallback):
         self._t0 = 0.0
         self.num_generations = num_generations
         self.reward_groups = {"all_correct": 0, "none_correct": 0, "mixed": 0}
+        self.seen_example_ids = set()
+        self.question_presentations = 0
 
     def sql_reward(self, completions, completion_prefix, gold_sql, db_path, **kwargs):
         values = sql_reward(completions, completion_prefix, gold_sql, db_path, **kwargs)
         if len(values) % self.num_generations:
             raise ValueError("Reward batch must contain complete generation groups")
+        example_ids = kwargs.get("example_id")
+        if example_ids is None or len(example_ids) != len(values):
+            raise ValueError("Reward callback requires a question ID for every completion")
         for start in range(0, len(values), self.num_generations):
+            group_ids = example_ids[start:start + self.num_generations]
+            if len(set(group_ids)) != 1:
+                raise ValueError("Generation group contains different question IDs")
+            self.seen_example_ids.add(group_ids[0])
+            self.question_presentations += 1
             count = sum(value >= 1.0 for value in values[start:start + self.num_generations])
             category = "mixed"
             if count == 0:
@@ -304,6 +317,8 @@ class StepStats(TrainerCallback):
             if self.steps:
                 metrics.update(self.steps[-1])
             metrics["optimizer_steps_skipped"] = self.optimizer_steps_skipped
+            metrics["train_unique_questions"] = len(self.seen_example_ids)
+            metrics["train_question_presentations"] = self.question_presentations
             metrics.update({f"reward_groups/{key}_cumulative": value for key, value in self.reward_groups.items()})
             self.experiment.log_metrics(metrics, step=state.global_step)
         # on_log вызывается после on_step_end того же шага (logging_steps=1)
@@ -366,6 +381,8 @@ class AdapterSnapshots(TrainerCallback):
             "global_step": state.global_step, "steps_done": state.global_step,
             "optimizer_steps_skipped": self.stats.optimizer_steps_skipped,
             "log_history": state.log_history, "reward_groups": self.stats.reward_groups,
+            "seen_example_ids": sorted(self.stats.seen_example_ids),
+            "question_presentations": self.stats.question_presentations,
         }
         metadata = checkpoint / "run.json"
         metadata.write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -459,7 +476,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         save_strategy="steps" if args.save_steps else "no",
         save_steps=args.save_steps or 500,
         save_only_model=True,
-        save_total_limit=2,
+        save_total_limit=args.keep_checkpoints,
         report_to="none",
         seed=args.seed,
         data_seed=args.seed,
@@ -581,6 +598,8 @@ def main() -> None:
     report["steps"] = stats.steps
     report["optimizer_steps_skipped"] = stats.optimizer_steps_skipped
     report["reward_groups"] = stats.reward_groups
+    report["seen_example_ids"] = sorted(stats.seen_example_ids)
+    report["question_presentations"] = stats.question_presentations
     path = out_dir / ("run.json" if args.export_model or args.save_adapter else f"{name}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)

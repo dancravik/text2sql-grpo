@@ -38,9 +38,11 @@ class SftGrpoTests(unittest.TestCase):
         namespace = definitions("StepStats")
         namespace["sql_reward"] = Mock(return_value=[0.1] * 4 + [1.1] * 4 + [0.1, 1.1, 0, 1])
         stats = namespace["StepStats"](num_generations=4)
-        values = stats.sql_reward([], [], [], [])
+        values = stats.sql_reward([], [], [], [], example_id=["a"] * 8 + ["b"] * 4)
         self.assertEqual(len(values), 12)
         self.assertEqual(stats.reward_groups, {"all_correct": 1, "none_correct": 1, "mixed": 1})
+        self.assertEqual(stats.seen_example_ids, {"a", "b"})
+        self.assertEqual(stats.question_presentations, 3)
 
     def test_snapshot_records_actual_step_and_sft_provenance(self):
         namespace = definitions("AdapterSnapshots")
@@ -51,7 +53,8 @@ class SftGrpoTests(unittest.TestCase):
             checkpoint = root / "trainer/checkpoint-32"
             checkpoint.mkdir(parents=True)
             stats = SimpleNamespace(experiment=Mock(), optimizer_steps_skipped=0,
-                                    reward_groups={"mixed": 20})
+                                    reward_groups={"mixed": 20}, seen_example_ids={"a"},
+                                    question_presentations=64)
             callback = namespace["AdapterSnapshots"](
                 {"initial_sft": {"adapter_sha256": "original"}}, stats, Mock(),
                 SimpleNamespace(out_dir=root, manifest=root / "manifest.json"),

@@ -18,7 +18,7 @@ from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 from comet_tracking import start_experiment
 source, evaluation = map(Path, sys.argv[1:3])
-archive = source / "grpo_pilot_artifacts.zip"
+archive = source / (sys.argv[4] if len(sys.argv) > 4 else "grpo_pilot_artifacts.zip")
 with ZipFile(archive, "w", ZIP_DEFLATED) as z:
     z.write(source / "run.json", "run.json")
     for path in (source / "adapter").rglob("*"):
@@ -70,6 +70,8 @@ def main():
     parser.add_argument("--init-sft-run", type=Path, help="Completed SFT run with adapter/ and run.json")
     parser.add_argument("--dataset", choices=["validation_fast", "validation"], default="validation_fast")
     parser.add_argument("--save-steps", type=int, default=0)
+    parser.add_argument("--num-questions", type=int, default=1024)
+    parser.add_argument("--keep-checkpoints", type=int, default=2)
     args = parser.parse_args()
     if len(args.gpus) != len(set(args.gpus)):
         parser.error("GPU IDs must be distinct")
@@ -77,6 +79,8 @@ def main():
         parser.error("Use distinct learning rates and at most one training per GPU")
     if args.steps < 1 or args.save_steps < 0 or any(not 0 < lr < 1 for lr in args.lrs):
         parser.error("Invalid steps or learning rate")
+    if args.num_questions < 1 or args.keep_checkpoints < 1:
+        parser.error("Question count and checkpoint retention must be positive")
     branch = "sft_grpo" if args.init_sft_run else "base_grpo"
     initialization = []
     if args.init_sft_run:
@@ -109,7 +113,8 @@ def main():
             "--manifest", ROOT / "splits/v1.json", "--out-dir", source / "training",
             "--name", f"{args.out_dir.name}_{label}", "--branch", branch, "--comet", "--save-adapter",
             "--save-steps", args.save_steps, *initialization,
-            "--num-questions", 1024, "--sample-policy", "random", "--prompts-per-step", 2,
+            "--keep-checkpoints", args.keep_checkpoints,
+            "--num-questions", args.num_questions, "--sample-policy", "random", "--prompts-per-step", 2,
             "--num-generations", 4, "--micro-batch-size", args.micro_batch,
             "--max-completion-length", 1024, "--max-steps", args.steps,
             "--lr", lr, "--lr-scheduler-type", "constant", "--beta", 0,
