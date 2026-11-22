@@ -1,4 +1,4 @@
-"""Train independent Base→GRPO LR pilots, then export and evaluate sequentially."""
+"""Train independent GRPO LR pilots, then export and evaluate sequentially."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,13 +67,23 @@ def main():
     parser.add_argument("--lrs", type=float, nargs="+", default=[5e-6, 1e-5])
     parser.add_argument("--steps", type=int, default=128)
     parser.add_argument("--micro-batch", type=int, choices=[1, 2, 4], default=2)
+    parser.add_argument("--init-sft-run", type=Path, help="Completed SFT run with adapter/ and run.json")
+    parser.add_argument("--dataset", choices=["validation_fast", "validation"], default="validation_fast")
+    parser.add_argument("--save-steps", type=int, default=0)
     args = parser.parse_args()
     if len(args.gpus) != len(set(args.gpus)):
         parser.error("GPU IDs must be distinct")
     if len(args.lrs) > len(args.gpus) or len(args.lrs) != len(set(args.lrs)):
         parser.error("Use distinct learning rates and at most one training per GPU")
-    if args.steps < 1 or any(not 0 < lr < 1 for lr in args.lrs):
+    if args.steps < 1 or args.save_steps < 0 or any(not 0 < lr < 1 for lr in args.lrs):
         parser.error("Invalid steps or learning rate")
+    branch = "sft_grpo" if args.init_sft_run else "base_grpo"
+    initialization = []
+    if args.init_sft_run:
+        args.init_sft_run = args.init_sft_run.resolve()
+        if not (args.init_sft_run / "adapter/adapter_model.safetensors").is_file():
+            parser.error("SFT adapter weights are missing")
+        initialization = ["--init-sft-run", str(args.init_sft_run)]
     if args.out_dir.exists():
         parser.error("Output directory exists; choose a new directory")
     if not os.environ.get("COMET_API_KEY") or not os.environ.get("DATA_DIR"):
@@ -82,7 +92,8 @@ def main():
     if shutil.disk_usage(args.out_dir.parent).free < 10 * 1024**3:
         parser.error("Leave at least 10 GiB of disk space")
     args.out_dir.mkdir()
-    summary = {"branch": "base_grpo", "stage": "lr_pilot", "created_at": datetime.now(timezone.utc).isoformat(),
+    summary = {"branch": branch, "stage": "lr_pilot", "dataset": args.dataset,
+               "created_at": datetime.now(timezone.utc).isoformat(),
                "completed": [], "failed": [], "training": []}
 
     def save():
@@ -96,7 +107,8 @@ def main():
         execute("feasibility_grpo.py", [
             "--model", "Qwen/Qwen3.5-2B", "--revision", "15852e8c16360a2fea060d615a32b45270f8a8fc",
             "--manifest", ROOT / "splits/v1.json", "--out-dir", source / "training",
-            "--name", f"{args.out_dir.name}_{label}", "--branch", "base_grpo", "--comet", "--save-adapter",
+            "--name", f"{args.out_dir.name}_{label}", "--branch", branch, "--comet", "--save-adapter",
+            "--save-steps", args.save_steps, *initialization,
             "--num-questions", 1024, "--sample-policy", "random", "--prompts-per-step", 2,
             "--num-generations", 4, "--micro-batch-size", args.micro_batch,
             "--max-completion-length", 1024, "--max-steps", args.steps,
@@ -128,7 +140,7 @@ def main():
                     source / "export.log", {**os.environ, "CUDA_VISIBLE_DEVICES": ""})
             execute("evaluate.py", [
                 "--model", exported / "merged", "--name", source.name,
-                "--datasets", "validation_fast", "--out-dir", evaluation.parent,
+                "--datasets", args.dataset, "--out-dir", evaluation.parent,
                 "--comet-run", exported / "run.json", "--n", 1, "--temperature", 0,
                 "--enable-thinking", "off", "--max-tokens", 1024, "--max-model-len", 4096, "--seed", 42,
             ], source / "evaluation.log", {**os.environ, "CUDA_VISIBLE_DEVICES": args.gpus[0]})
@@ -137,7 +149,7 @@ def main():
                 shutil.copy2(logfile, training / logfile.name)
             subprocess.run([sys.executable, "-u", "-c", BACKUP, str(training), str(evaluation), str(ROOT)],
                            env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, check=True)
-            metrics = json.loads((evaluation / "metrics.json").read_text())["datasets"]["validation_fast"]
+            metrics = json.loads((evaluation / "metrics.json").read_text())["datasets"][args.dataset]
             summary["completed"].append({**trial, "metrics": metrics})
             shutil.rmtree(exported / "merged")
             print(f"{source.name}: accuracy {metrics['greedy_execution_accuracy']:.2%}", flush=True)

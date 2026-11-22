@@ -36,7 +36,7 @@ import torch
 import transformers
 import trl
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -104,9 +104,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--comet", action="store_true")
     p.add_argument("--name", help="Unique experiment name, including the starting branch and probe stage")
     p.add_argument("--branch", choices=["base_grpo", "sft_grpo"], default="base_grpo")
+    p.add_argument("--init-sft-run", help="Completed SFT run containing run.json and adapter/")
+    p.add_argument("--save-steps", type=int, default=0, help="Upload intermediate adapter snapshots to Comet; 0 disables")
     p.add_argument("--fp16-init-scale", type=float, default=128.0, help="Initial dynamic loss scale for export runs")
     p.add_argument("--smoke", action="store_true", help="max_steps=2")
     args = p.parse_args()
+    if (args.branch == "sft_grpo") != bool(args.init_sft_run):
+        p.error("Use --branch sft_grpo together with --init-sft-run")
+    if args.save_steps < 0 or (args.save_steps and not args.comet):
+        p.error("--save-steps must be nonnegative and requires --comet")
     if args.smoke:
         args.max_steps = 2
     if args.micro_batch_size is None:
@@ -249,12 +255,28 @@ def linear_attn_kernels() -> dict[str, bool]:
 class StepStats(TrainerCallback):
     """Время и пиковая память каждого шага оптимизатора, награда и длина ответа из логов trl."""
 
-    def __init__(self, experiment=None) -> None:
+    def __init__(self, experiment=None, num_generations=4) -> None:
         self.experiment = experiment
         self.steps: list[dict] = []
         self.optimizer_steps_skipped = 0
         self.accelerator = None
         self._t0 = 0.0
+        self.num_generations = num_generations
+        self.reward_groups = {"all_correct": 0, "none_correct": 0, "mixed": 0}
+
+    def sql_reward(self, completions, completion_prefix, gold_sql, db_path, **kwargs):
+        values = sql_reward(completions, completion_prefix, gold_sql, db_path, **kwargs)
+        if len(values) % self.num_generations:
+            raise ValueError("Reward batch must contain complete generation groups")
+        for start in range(0, len(values), self.num_generations):
+            count = sum(value >= 1.0 for value in values[start:start + self.num_generations])
+            category = "mixed"
+            if count == 0:
+                category = "none_correct"
+            elif count == self.num_generations:
+                category = "all_correct"
+            self.reward_groups[category] += 1
+        return values
 
     def on_optimizer_step(self, args, state, control, **kwargs) -> None:
         if self.accelerator is not None:
@@ -282,6 +304,7 @@ class StepStats(TrainerCallback):
             if self.steps:
                 metrics.update(self.steps[-1])
             metrics["optimizer_steps_skipped"] = self.optimizer_steps_skipped
+            metrics.update({f"reward_groups/{key}_cumulative": value for key, value in self.reward_groups.items()})
             self.experiment.log_metrics(metrics, step=state.global_step)
         # on_log вызывается после on_step_end того же шага (logging_steps=1)
         if not logs or not self.steps or "reward" not in logs:
@@ -326,12 +349,53 @@ def error_status(e: BaseException) -> str:
     return f"{type(e).__name__}: {msg}"
 
 
+class AdapterSnapshots(TrainerCallback):
+    """Upload intermediate adapter weights and provenance for later evaluation."""
+
+    def __init__(self, report, stats, tokenizer, options):
+        self.report = report
+        self.stats = stats
+        self.tokenizer = tokenizer
+        self.options = options
+
+    def on_save(self, args, state, control, **kwargs):
+        checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        self.tokenizer.save_pretrained(checkpoint)
+        snapshot = {
+            **self.report, "status": "ok", "snapshot": True,
+            "global_step": state.global_step, "steps_done": state.global_step,
+            "optimizer_steps_skipped": self.stats.optimizer_steps_skipped,
+            "log_history": state.log_history, "reward_groups": self.stats.reward_groups,
+        }
+        metadata = checkpoint / "run.json"
+        metadata.write_text(json.dumps(snapshot, indent=2) + "\n")
+        upload_training_bundle(
+            self.stats.experiment, checkpoint,
+            Path(self.options.out_dir) / f"grpo_checkpoint_{state.global_step}.zip",
+            step=state.global_step,
+            extra_files=[(Path(self.options.manifest), "splits/v1.json")],
+        )
+
+
 def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     """Загрузка модели, LoRA, GRPOTrainer и обучение на max_steps шагов; заполняет report."""
     set_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     dataset, prompt_lens = build_dataset(tokenizer, args)
     report["manifest_sha256"] = sha256_file(Path(args.manifest))
+    if args.init_sft_run:
+        source = Path(args.init_sft_run)
+        initial = json.loads((source / "run.json").read_text())
+        if (initial.get("status") != "ok"
+                or initial.get("manifest_sha256") != report["manifest_sha256"]
+                or initial["args"]["model"] != args.model
+                or initial.get("base_revision") != args.revision):
+            raise ValueError("SFT status, manifest, base model or revision does not match")
+        report["initial_sft"] = {
+            "run": str(source), "comet_experiment_key": initial.get("comet_experiment_key"),
+            "global_step": initial["global_step"],
+            "adapter_sha256": sha256_file(source / "adapter/adapter_model.safetensors"),
+        }
     report["train_example_ids"] = list(dataset["example_id"])
     report["prompt_tokens_mean"] = sum(prompt_lens) / len(prompt_lens)
     report["prompt_tokens_min"] = min(prompt_lens)
@@ -341,11 +405,32 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     # Retain Qwen's full architecture for the checkpoint consumed by evaluate.py.
     model, info = load_model(
         args.model,
-        text_only=args.use_vllm == "none" and not args.export_model and not args.save_adapter and not args.full_model,
+        text_only=(args.use_vllm == "none" and not args.export_model and not args.save_adapter
+                   and not args.full_model and not args.init_sft_run),
         revision=args.revision,
     )
     report.update(info)
-    model = add_lora(model, args, has_vision=info["vision_params"] > 0)
+    if args.init_sft_run:
+        from safetensors.torch import load_file
+
+        adapter = Path(args.init_sft_run) / "adapter"
+        model = PeftModel.from_pretrained(model, adapter, is_trainable=True)
+        expected = load_file(str(adapter / "adapter_model.safetensors"))
+        actual = get_peft_model_state_dict(model)
+        if actual.keys() != expected.keys() or any(
+            not torch.equal(actual[key].detach().cpu(), value) for key, value in expected.items()
+        ):
+            raise RuntimeError("Loaded adapter weights differ from the saved SFT adapter")
+        if {p.dtype for p in model.parameters() if p.requires_grad} != {torch.float32}:
+            raise RuntimeError("SFT adapter must have FP32 trainable parameters")
+        config = model.peft_config["default"]
+        if config.r != args.lora_r or config.lora_alpha != args.lora_alpha:
+            raise ValueError("Requested LoRA rank/alpha differ from the SFT adapter")
+        report["initial_sft"]["weights_verified"] = True
+        del actual, expected
+        print("Loaded and verified SFT adapter; continuing its LoRA weights", flush=True)
+    else:
+        model = add_lora(model, args, has_vision=info["vision_params"] > 0)
     trainable, total = model.get_nb_trainable_parameters()
     report["num_params"] = total - trainable
     report["trainable_params"] = trainable
@@ -371,7 +456,10 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         gradient_checkpointing=True,
         logging_steps=1,
         logging_nan_inf_filter=not args.export_model,
-        save_strategy="no",
+        save_strategy="steps" if args.save_steps else "no",
+        save_steps=args.save_steps or 500,
+        save_only_model=True,
+        save_total_limit=2,
         report_to="none",
         seed=args.seed,
         data_seed=args.seed,
@@ -387,12 +475,12 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
 
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=sql_reward,
+        reward_funcs=stats.sql_reward,
         args=config,
         train_dataset=dataset,
         # Токенизатор, а не AutoProcessor: промпты текстовые, процессор Qwen3.5 включил бы режим VLM
         processing_class=tokenizer,
-        callbacks=[stats],
+        callbacks=[stats, AdapterSnapshots(report, stats, tokenizer, args)] if args.save_steps else [stats],
     )
     report["memory_after_init_gb"] = torch.cuda.memory_allocated() / GB
     print(f"Memory after init: {report['memory_after_init_gb']:.2f} GB")
@@ -432,6 +520,12 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["train_loss"] = result.training_loss
 
     out_dir = Path(args.out_dir)
+    if args.init_sft_run:
+        initial_weights = load_file(str(Path(args.init_sft_run) / "adapter/adapter_model.safetensors"))
+        current_weights = get_peft_model_state_dict(model)
+        if all(torch.equal(current_weights[key].detach().cpu(), value) for key, value in initial_weights.items()):
+            raise RuntimeError("SFT adapter did not change during GRPO")
+        del initial_weights, current_weights
     model.save_pretrained(out_dir / "adapter")
     tokenizer.save_pretrained(out_dir / "adapter")
     report["export_status"] = "pending" if args.export_model else "adapter_only"
@@ -473,7 +567,7 @@ def main() -> None:
     if experiment is not None:
         report["comet_experiment_key"] = experiment.get_key()
         experiment.log_parameters({**vars(args), "versions": vers})
-    stats = StepStats(experiment)
+    stats = StepStats(experiment, args.num_generations)
     try:
         run(args, report, stats)
         report["status"] = "ok"
@@ -486,6 +580,7 @@ def main() -> None:
     report.update(summarize(stats.steps))
     report["steps"] = stats.steps
     report["optimizer_steps_skipped"] = stats.optimizer_steps_skipped
+    report["reward_groups"] = stats.reward_groups
     path = out_dir / ("run.json" if args.export_model or args.save_adapter else f"{name}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
