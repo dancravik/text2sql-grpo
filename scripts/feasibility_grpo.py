@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--revision", help="Hugging Face revision for the starting model and tokenizer")
     p.add_argument("--manifest", type=str, default=str(DEFAULT_MANIFEST))
     p.add_argument("--num-questions", type=int, default=64)
+    p.add_argument("--train-ids", help="JSON list of IDs from the frozen train split, in dataset order")
     p.add_argument("--sample-policy", choices=["random", "longest"], default="random")
     p.add_argument("--num-generations", type=int, default=8)
     p.add_argument("--prompts-per-step", type=int, default=4)
@@ -84,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lr", type=float, default=5e-6)
+    p.add_argument("--loss-type", choices=["dapo", "grpo"], help="Override the TRL loss normalization")
     p.add_argument("--lr-scheduler-type", choices=["linear", "constant"], default="linear")
     p.add_argument("--beta", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=0.8, help="как в probe_models.py")
@@ -170,7 +172,14 @@ def versions() -> dict[str, str | None]:
 def build_dataset(tokenizer, args: argparse.Namespace) -> tuple[Dataset, list[int]]:
     """Готовые промпты из render_prompt + поля для награды; возвращает датасет и длины промптов."""
     examples = load_split("train", DATA_DIR, Path(args.manifest))
-    if args.sample_policy == "random":
+    if args.train_ids:
+        ids = json.loads(Path(args.train_ids).read_text())
+        by_id = {ex["id"]: ex for ex in examples}
+        if (args.sample_policy != "random" or not isinstance(ids, list) or not ids
+                or len(ids) != args.num_questions or len(set(ids)) != len(ids) or set(ids) - by_id.keys()):
+            raise ValueError("--train-ids must contain num-questions unique frozen train IDs")
+        examples = [by_id[key] for key in ids]
+    elif args.sample_policy == "random":
         examples = random.Random(args.seed).sample(examples, min(args.num_questions, len(examples)))
     enable_thinking = args.enable_thinking == "on"
 
@@ -501,6 +510,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         beta=args.beta,
+        **({"loss_type": args.loss_type} if args.loss_type else {}),
         fp16=True,
         bf16=False,
         gradient_checkpointing=True,
@@ -521,6 +531,7 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         vllm_max_model_length=max(prompt_lens) + args.max_completion_length,
     )
     report["grad_accum_steps"] = grad_accum
+    report["loss_type"] = config.loss_type
     report["generation_batch_size"] = config.generation_batch_size
 
     trainer_class = GRPOTrainer

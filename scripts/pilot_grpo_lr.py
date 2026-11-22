@@ -2,12 +2,15 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,22 +44,37 @@ finally:
 '''
 
 
-def execute(script, arguments, logfile, env):
+def log_tail(path):
+    with path.open("rb") as stream:
+        stream.seek(max(0, path.stat().st_size - 8192))
+        return stream.read().decode(errors="replace").splitlines()
+
+
+def execute(script, arguments, logfile, env, *, timeout=None):
+    started = time.monotonic()
     with logfile.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             [sys.executable, "-u", str(ROOT / "scripts" / script), *map(str, arguments)],
-            cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+            cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
         while True:
             try:
                 code = process.wait(timeout=30)
                 break
             except subprocess.TimeoutExpired:
-                lines = logfile.read_text(errors="replace").splitlines()
+                if timeout and time.monotonic() - started >= timeout:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    raise TimeoutError(f"{script} exceeded {timeout}s; log: {logfile}")
+                lines = log_tail(logfile)
                 last = lines[-1][-250:] if lines else "starting"
                 print(f"[{logfile.parent.name}/{script}] alive: {last}", flush=True)
     if code:
-        tail = "\n".join(logfile.read_text(errors="replace").splitlines()[-15:])
+        # A killed vLLM parent can leave a worker holding GPU memory.
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        tail = "\n".join(log_tail(logfile)[-15:])
         raise RuntimeError(f"{script}: exit {code}; log {logfile}\n{tail}")
 
 

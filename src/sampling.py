@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from vllm import LLM
 
 
-def load_llm(model_id: str, max_model_len: int, seed: int, revision: str | None = None) -> "LLM":
+def load_llm(model_id: str, max_model_len: int, seed: int, revision: str | None = None,
+             *, low_memory: bool = False) -> "LLM":
     """vLLM-модель в fp16 (T4 не поддерживает bf16)."""
     from vllm import LLM
 
@@ -25,6 +26,7 @@ def load_llm(model_id: str, max_model_len: int, seed: int, revision: str | None 
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,
         seed=seed,
+        **({"enforce_eager": True, "max_num_seqs": 8} if low_memory else {}),
     )
 
 

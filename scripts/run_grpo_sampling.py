@@ -93,7 +93,8 @@ def compare(folder, sft, budget):
 def make_archive(folder, sft):
     archive = folder.parent / f"{folder.name}_complete.zip"
     complete = (folder / "comparison.json").is_file()
-    with ZipFile(archive, "w", ZIP_DEFLATED, allowZip64=True) as bundle:
+    temporary = archive.with_suffix(".zip.tmp")
+    with ZipFile(temporary, "w", ZIP_DEFLATED, allowZip64=True) as bundle:
         for path in sorted(folder.rglob("*")):
             relative = path.relative_to(folder)
             if not path.is_file() or path.suffix == ".zip" or "merged" in relative.parts:
@@ -110,9 +111,10 @@ def make_archive(folder, sft):
         bundle.write(ROOT / "splits/v1.json", "repository/splits/v1.json")
         bundle.writestr("environment/pip_freeze.txt", subprocess.check_output(
             [sys.executable, "-m", "pip", "freeze"], text=True))
-    with ZipFile(archive) as bundle:
+    with ZipFile(temporary) as bundle:
         if bundle.testzip() is not None:
             raise RuntimeError("Artifact ZIP failed integrity checking")
+    temporary.replace(archive)
     print(f"Archive: {archive}", flush=True)
 
 

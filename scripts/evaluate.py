@@ -32,7 +32,7 @@ from reward import compare, execute  # noqa: E402
 from sampling import load_llm, sample_and_score  # noqa: E402
 from splits import DEFAULT_MANIFEST, load_split, read_manifest, sha256_file  # noqa: E402
 
-EVAL_SPLITS = ("validation", "validation_fast", "test_spider", "test_bird")
+EVAL_SPLITS = ("validation", "validation_fast", "test_spider", "test_bird", "train")
 OUTCOMES = ["no_sql", "exec_error", "wrong", "correct"]
 RAW_SQL = re.compile(r"^(?:SELECT|WITH)\b", re.IGNORECASE)
 SQL_FENCE = re.compile(r"```(?:sql)?\s*\n(.*?)\n?```", re.IGNORECASE | re.DOTALL)
@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--max-model-len", type=int, default=4096)
+    p.add_argument("--low-memory", action="store_true", help="Use eager vLLM with at most 8 concurrent sequences")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--enable-thinking", choices=["on", "off"], default="off",
@@ -191,7 +192,8 @@ def main() -> None:
     manifest = read_manifest(manifest_path)
     # Verify data before allocating the GPU; never silently remove failed golds.
     datasets = {name: load_split(name, DATA_DIR, manifest_path) for name in args.datasets}
-    llm = load_llm(args.model, args.max_model_len, args.seed, revision=args.revision) if saved is None else None
+    llm = (load_llm(args.model, args.max_model_len, args.seed, revision=args.revision, low_memory=args.low_memory)
+           if saved is None else None)
     report = {
         "model": args.model,
         "args": saved["args"] if saved is not None else {
@@ -214,9 +216,16 @@ def main() -> None:
             examples = examples[:20]
         if saved is None:
             check_lengths(llm.get_tokenizer(), examples, args)
-            records, gen_time = sample_and_score(
-                llm, examples, args.n, args.temperature, args.max_tokens, args.seed, args.enable_thinking
-            )
+            # Bound the number of SQLite result sets and vLLM outputs retained during the train audit.
+            chunk = 96 if dataset == "train" else len(examples)
+            records, gen_time = [], 0.0
+            for offset in range(0, len(examples), chunk):
+                batch, seconds = sample_and_score(
+                    llm, examples[offset:offset + chunk], args.n, args.temperature,
+                    args.max_tokens, args.seed, args.enable_thinking
+                )
+                records.extend(batch)
+                gen_time += seconds
             records = [
                 {**{k: ex[k] for k in ("question", "evidence", "gold_sql", "db_id", "difficulty")}, **r}
                 for ex, r in zip(examples, records, strict=True)
