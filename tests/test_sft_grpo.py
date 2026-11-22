@@ -23,6 +23,20 @@ def definitions(*names):
 
 
 class SftGrpoTests(unittest.TestCase):
+    def test_exhausted_rollout_budget_stops_after_optimizer_step(self):
+        namespace = definitions("StepStats")
+        namespace.update(
+            torch=SimpleNamespace(cuda=SimpleNamespace(
+                synchronize=Mock(), mem_get_info=Mock(return_value=(10, 20)),
+                max_memory_allocated=Mock(return_value=1), max_memory_reserved=Mock(return_value=1),
+            )), time=SimpleNamespace(perf_counter=lambda: 1), GB=1024**3,
+        )
+        stats = namespace["StepStats"]()
+        stats.rollout_budget_exhausted = True
+        control = SimpleNamespace(should_training_stop=False)
+        stats.on_step_end(None, SimpleNamespace(global_step=3), control)
+        self.assertTrue(control.should_training_stop)
+
     def test_sft_branch_requires_saved_initial_weights(self):
         parse = definitions("parse_args")["parse_args"]
         with patch.object(sys, "argv", ["grpo", "--model", "base", "--branch", "sft_grpo"]):
@@ -54,7 +68,8 @@ class SftGrpoTests(unittest.TestCase):
             checkpoint.mkdir(parents=True)
             stats = SimpleNamespace(experiment=Mock(), optimizer_steps_skipped=0,
                                     reward_groups={"mixed": 20}, seen_example_ids={"a"},
-                                    question_presentations=64)
+                                    question_presentations=64, sampling_metrics={},
+                                    generated_completion_tokens=100)
             callback = namespace["AdapterSnapshots"](
                 {"initial_sft": {"adapter_sha256": "original"}}, stats, Mock(),
                 SimpleNamespace(out_dir=root, manifest=root / "manifest.json"),

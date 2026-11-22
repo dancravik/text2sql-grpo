@@ -58,6 +58,7 @@ from reward import reward  # noqa: E402
 from splits import DEFAULT_MANIFEST, load_split, sha256_file  # noqa: E402
 from comet_tracking import start_experiment  # noqa: E402
 from train_sft import upload_training_bundle  # noqa: E402
+from grpo_sampling import BudgetedSamplingMixin  # noqa: E402
 
 GB = 1024**3
 # Ключи из логов trl, которые сохраняем по каждому шагу
@@ -107,17 +108,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-sft-run", help="Completed SFT run containing run.json and adapter/")
     p.add_argument("--save-steps", type=int, default=0, help="Upload intermediate adapter snapshots to Comet; 0 disables")
     p.add_argument("--keep-checkpoints", type=int, default=2)
+    p.add_argument("--sampling-mode", choices=["ordinary", "dynamic"])
+    p.add_argument("--rollout-budget", type=int, default=0, help="Total question groups generated, including discarded groups")
+    p.add_argument("--max-sampling-rounds", type=int, default=8)
     p.add_argument("--fp16-init-scale", type=float, default=128.0, help="Initial dynamic loss scale for export runs")
     p.add_argument("--smoke", action="store_true", help="max_steps=2")
     args = p.parse_args()
+    if args.smoke:
+        args.max_steps = 2
     if (args.branch == "sft_grpo") != bool(args.init_sft_run):
         p.error("Use --branch sft_grpo together with --init-sft-run")
     if args.keep_checkpoints < 1:
         p.error("--keep-checkpoints must be positive")
+    if args.prompts_per_step < 1:
+        p.error("--prompts-per-step must be positive")
+    if args.sampling_mode:
+        if (args.rollout_budget < args.prompts_per_step
+                or args.rollout_budget % args.prompts_per_step
+                or args.max_sampling_rounds < 1):
+            p.error("Set a positive rollout budget divisible by prompts-per-step and a positive refill limit")
+        if args.max_steps < args.rollout_budget // args.prompts_per_step:
+            p.error("max-steps must allow the full rollout budget in ordinary mode")
+        if args.beta != 0 or args.use_vllm != "none":
+            p.error("Budgeted sampling supports beta=0 and use-vllm=none")
+    elif args.rollout_budget:
+        p.error("--rollout-budget requires --sampling-mode")
     if args.save_steps < 0 or (args.save_steps and not args.comet):
         p.error("--save-steps must be nonnegative and requires --comet")
-    if args.smoke:
-        args.max_steps = 2
     if args.micro_batch_size is None:
         args.micro_batch_size = args.num_generations
     for name in ("num_questions", "prompts_per_step", "micro_batch_size", "max_steps", "max_completion_length"):
@@ -268,9 +285,15 @@ class StepStats(TrainerCallback):
         self.reward_groups = {"all_correct": 0, "none_correct": 0, "mixed": 0}
         self.seen_example_ids = set()
         self.question_presentations = 0
+        self.last_rewards = []
+        self.generated_completion_tokens = 0
+        self.rollout_budget_exhausted = False
+        self.sampling_metrics = {}
 
     def sql_reward(self, completions, completion_prefix, gold_sql, db_path, **kwargs):
         values = sql_reward(completions, completion_prefix, gold_sql, db_path, **kwargs)
+        self.last_rewards = values
+        self.generated_completion_tokens += sum(len(ids) for ids in kwargs.get("completion_ids", []))
         if len(values) % self.num_generations:
             raise ValueError("Reward batch must contain complete generation groups")
         example_ids = kwargs.get("example_id")
@@ -310,6 +333,8 @@ class StepStats(TrainerCallback):
             "peak_reserved_gb": torch.cuda.max_memory_reserved() / GB,
             "device_used_gb": (total - free) / GB,
         })
+        if self.rollout_budget_exhausted:
+            control.should_training_stop = True
 
     def on_log(self, args, state, control, logs=None, **kwargs) -> None:
         if self.experiment is not None and logs:
@@ -319,6 +344,8 @@ class StepStats(TrainerCallback):
             metrics["optimizer_steps_skipped"] = self.optimizer_steps_skipped
             metrics["train_unique_questions"] = len(self.seen_example_ids)
             metrics["train_question_presentations"] = self.question_presentations
+            metrics["generated_completion_tokens"] = self.generated_completion_tokens
+            metrics.update({f"sampling/{key}": value for key, value in self.sampling_metrics.items()})
             metrics.update({f"reward_groups/{key}_cumulative": value for key, value in self.reward_groups.items()})
             self.experiment.log_metrics(metrics, step=state.global_step)
         # on_log вызывается после on_step_end того же шага (logging_steps=1)
@@ -364,6 +391,10 @@ def error_status(e: BaseException) -> str:
     return f"{type(e).__name__}: {msg}"
 
 
+class BudgetedGRPOTrainer(BudgetedSamplingMixin, GRPOTrainer):
+    pass
+
+
 class AdapterSnapshots(TrainerCallback):
     """Upload intermediate adapter weights and provenance for later evaluation."""
 
@@ -383,6 +414,8 @@ class AdapterSnapshots(TrainerCallback):
             "log_history": state.log_history, "reward_groups": self.stats.reward_groups,
             "seen_example_ids": sorted(self.stats.seen_example_ids),
             "question_presentations": self.stats.question_presentations,
+            "sampling_metrics": self.stats.sampling_metrics,
+            "generated_completion_tokens": self.stats.generated_completion_tokens,
         }
         metadata = checkpoint / "run.json"
         metadata.write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -490,7 +523,12 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     report["grad_accum_steps"] = grad_accum
     report["generation_batch_size"] = config.generation_batch_size
 
-    trainer = GRPOTrainer(
+    trainer_class = GRPOTrainer
+    if args.sampling_mode:
+        if trl.__version__ != "1.16.0":
+            raise ValueError("Budgeted sampling has been integrated with TRL 1.16.0")
+        trainer_class = BudgetedGRPOTrainer
+    trainer = trainer_class(
         model=model,
         reward_funcs=stats.sql_reward,
         args=config,
@@ -499,6 +537,12 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
         processing_class=tokenizer,
         callbacks=[stats, AdapterSnapshots(report, stats, tokenizer, args)] if args.save_steps else [stats],
     )
+    if args.sampling_mode:
+        trainer.configure_sampling(
+            mode=args.sampling_mode, budget=args.rollout_budget,
+            prompts_per_step=args.prompts_per_step, rounds=args.max_sampling_rounds,
+            seed=args.seed, stats=stats,
+        )
     report["memory_after_init_gb"] = torch.cuda.memory_allocated() / GB
     print(f"Memory after init: {report['memory_after_init_gb']:.2f} GB")
     stats.accelerator = trainer.accelerator
@@ -523,6 +567,10 @@ def run(args: argparse.Namespace, report: dict, stats: StepStats) -> None:
     if not math.isfinite(result.training_loss):
         raise RuntimeError(f"Non-finite training loss: {result.training_loss}")
     report["train_loss"] = result.training_loss
+    if args.sampling_mode:
+        report["generated_question_ids"] = trainer.sampling_question_ids
+        if stats.question_presentations != args.rollout_budget:
+            raise RuntimeError("Training stopped before consuming the requested rollout budget")
     if not (args.export_model or args.save_adapter):
         return
 
@@ -600,6 +648,8 @@ def main() -> None:
     report["reward_groups"] = stats.reward_groups
     report["seen_example_ids"] = sorted(stats.seen_example_ids)
     report["question_presentations"] = stats.question_presentations
+    report["sampling_metrics"] = stats.sampling_metrics
+    report["generated_completion_tokens"] = stats.generated_completion_tokens
     path = out_dir / ("run.json" if args.export_model or args.save_adapter else f"{name}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)

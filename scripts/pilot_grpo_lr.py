@@ -72,6 +72,9 @@ def main():
     parser.add_argument("--save-steps", type=int, default=0)
     parser.add_argument("--num-questions", type=int, default=1024)
     parser.add_argument("--keep-checkpoints", type=int, default=2)
+    parser.add_argument("--sampling-modes", nargs="+", choices=["ordinary", "dynamic"])
+    parser.add_argument("--rollout-budget", type=int, default=0)
+    parser.add_argument("--max-sampling-rounds", type=int, default=8)
     args = parser.parse_args()
     if len(args.gpus) != len(set(args.gpus)):
         parser.error("GPU IDs must be distinct")
@@ -81,6 +84,19 @@ def main():
         parser.error("Invalid steps or learning rate")
     if args.num_questions < 1 or args.keep_checkpoints < 1:
         parser.error("Question count and checkpoint retention must be positive")
+    trials = [(lr, None) for lr in args.lrs]
+    if args.sampling_modes:
+        if len(args.lrs) != 1 or len(set(args.sampling_modes)) != len(args.sampling_modes):
+            parser.error("Sampling comparison requires one LR and distinct modes")
+        if args.rollout_budget < 2 or args.rollout_budget % 2 or args.steps < args.rollout_budget // 2:
+            parser.error("Set an even positive rollout budget and enough steps to consume it")
+        if args.max_sampling_rounds < 1:
+            parser.error("Sampling rounds must be positive")
+        trials = [(args.lrs[0], mode) for mode in args.sampling_modes]
+    elif args.rollout_budget:
+        parser.error("Rollout budget requires sampling modes")
+    if len(trials) > len(args.gpus):
+        parser.error("At most one training per GPU")
     branch = "sft_grpo" if args.init_sft_run else "base_grpo"
     initialization = []
     if args.init_sft_run:
@@ -96,24 +112,30 @@ def main():
     if shutil.disk_usage(args.out_dir.parent).free < 10 * 1024**3:
         parser.error("Leave at least 10 GiB of disk space")
     args.out_dir.mkdir()
-    summary = {"branch": branch, "stage": "lr_pilot", "dataset": args.dataset,
+    summary = {"branch": branch, "stage": "sampling_comparison" if args.sampling_modes else "lr_pilot",
+               "rollout_budget": args.rollout_budget, "dataset": args.dataset,
                "created_at": datetime.now(timezone.utc).isoformat(),
                "completed": [], "failed": [], "training": []}
 
     def save():
         (args.out_dir / "selection.json").write_text(json.dumps(summary, indent=2) + "\n")
 
-    def train(lr, gpu):
-        label = f"lr_{lr:g}"
+    def train(lr, mode, gpu):
+        label = f"lr_{lr:g}" if mode is None else f"{mode}_lr_{lr:g}"
         source = args.out_dir / label
         source.mkdir()
         print(f"Training {label} on GPU {gpu}; log: {source / 'train.log'}", flush=True)
+        sampling_arguments = []
+        if mode:
+            sampling_arguments = ["--sampling-mode", mode, "--rollout-budget", args.rollout_budget,
+                                  "--max-sampling-rounds", args.max_sampling_rounds]
         execute("feasibility_grpo.py", [
             "--model", "Qwen/Qwen3.5-2B", "--revision", "15852e8c16360a2fea060d615a32b45270f8a8fc",
             "--manifest", ROOT / "splits/v1.json", "--out-dir", source / "training",
             "--name", f"{args.out_dir.name}_{label}", "--branch", branch, "--comet", "--save-adapter",
             "--save-steps", args.save_steps, *initialization,
             "--keep-checkpoints", args.keep_checkpoints,
+            *sampling_arguments,
             "--num-questions", args.num_questions, "--sample-policy", "random", "--prompts-per-step", 2,
             "--num-generations", 4, "--micro-batch-size", args.micro_batch,
             "--max-completion-length", 1024, "--max-steps", args.steps,
@@ -121,16 +143,17 @@ def main():
             "--temperature", 0.8, "--enable-thinking", "off", "--use-vllm", "none", "--seed", 42,
         ], source / "train.log", {**os.environ, "CUDA_VISIBLE_DEVICES": gpu})
         print(f"Training finished: {label}", flush=True)
-        return {"learning_rate": lr, "source": str(source), "gpu": gpu}
+        return {"learning_rate": lr, "sampling_mode": mode, "source": str(source), "gpu": gpu}
 
     # No merging or vLLM while either training process is still alive.
-    with ThreadPoolExecutor(max_workers=len(args.lrs)) as pool:
-        jobs = {pool.submit(train, lr, gpu): lr for lr, gpu in zip(args.lrs, args.gpus)}
+    with ThreadPoolExecutor(max_workers=len(trials)) as pool:
+        jobs = {pool.submit(train, lr, mode, gpu): {"learning_rate": lr, "sampling_mode": mode}
+                for (lr, mode), gpu in zip(trials, args.gpus)}
         for future in as_completed(jobs):
             try:
                 summary["training"].append(future.result())
             except Exception as error:
-                summary["failed"].append({"learning_rate": jobs[future], "stage": "training", "error": str(error)})
+                summary["failed"].append({**jobs[future], "stage": "training", "error": str(error)})
                 print(str(error), flush=True)
             save()
 
