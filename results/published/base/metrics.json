@@ -1,0 +1,44 @@
+{
+  "model": "Qwen/Qwen3.5-2B",
+  "args": {
+    "model": "Qwen/Qwen3.5-2B",
+    "from_run": null,
+    "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+    "name": "base",
+    "datasets": [
+      "validation"
+    ],
+    "manifest": "/kaggle/working/text2sql-grpo/splits/v1.json",
+    "comet_run": null,
+    "n": 1,
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "max_model_len": 4096,
+    "seed": 42,
+    "enable_thinking": false,
+    "out_dir": "/kaggle/working/text2sql_runs/v1/eval/validation",
+    "smoke": false
+  },
+  "datasets": {
+    "validation": {
+      "num_excluded": 0,
+      "num_questions": 956,
+      "accuracy": 0.32112970711297073,
+      "greedy_execution_accuracy": 0.32112970711297073,
+      "greedy_execution_accuracy_allow_untagged": 0.5135983263598326,
+      "out_no_sql_allow_untagged": 0.0020920502092050207,
+      "out_no_sql": 0.3817991631799163,
+      "out_exec_error": 0.07322175732217573,
+      "out_wrong": 0.22384937238493724,
+      "out_correct": 0.32112970711297073,
+      "format_ok": 0.5826359832635983,
+      "truncated": 0.0020920502092050207,
+      "prompt_tokens_mean": 525.8326359832636,
+      "prompt_tokens_max": 1415,
+      "completion_tokens_mean": 43.30020920502092,
+      "gen_time_s": 142.12960386276245
+    }
+  },
+  "manifest_sha256": "1c1c82fe943f872f786f47574ff804db2f57b893f8c3b0f611ff30c9848fc0db",
+  "vllm_version": "0.31.0"
+}

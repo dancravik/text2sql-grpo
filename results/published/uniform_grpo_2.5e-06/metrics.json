@@ -1,0 +1,45 @@
+{
+  "model": "/kaggle/working/text2sql_runs/v1/sft_grpo_overnight_v1/uniform_grpo_2.5e-06/evaluation/export-s_6m32ft/exported/merged",
+  "args": {
+    "model": "/kaggle/working/text2sql_runs/v1/sft_grpo_overnight_v1/uniform_grpo_2.5e-06/evaluation/export-s_6m32ft/exported/merged",
+    "from_run": null,
+    "revision": null,
+    "name": "evaluation",
+    "datasets": [
+      "validation"
+    ],
+    "manifest": "/kaggle/working/text2sql-grpo-sft/splits/v1.json",
+    "comet_run": null,
+    "n": 1,
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "max_model_len": 4096,
+    "low_memory": false,
+    "seed": 42,
+    "enable_thinking": false,
+    "out_dir": "/kaggle/working/text2sql_runs/v1/sft_grpo_overnight_v1/uniform_grpo_2.5e-06",
+    "smoke": false
+  },
+  "datasets": {
+    "validation": {
+      "num_excluded": 0,
+      "num_questions": 956,
+      "accuracy": 0.7144351464435147,
+      "greedy_execution_accuracy": 0.7144351464435147,
+      "greedy_execution_accuracy_allow_untagged": 0.7144351464435147,
+      "out_no_sql_allow_untagged": 0.0,
+      "out_no_sql": 0.0,
+      "out_exec_error": 0.08054393305439331,
+      "out_wrong": 0.20502092050209206,
+      "out_correct": 0.7144351464435147,
+      "format_ok": 1.0,
+      "truncated": 0.0,
+      "prompt_tokens_mean": 525.8326359832636,
+      "prompt_tokens_max": 1415,
+      "completion_tokens_mean": 37.12029288702929,
+      "gen_time_s": 124.0792224407196
+    }
+  },
+  "manifest_sha256": "1c1c82fe943f872f786f47574ff804db2f57b893f8c3b0f611ff30c9848fc0db",
+  "vllm_version": "0.31.0"
+}

@@ -1,0 +1,97 @@
+{
+  "num_questions": 956,
+  "sft_accuracy": 0.7102510460251046,
+  "generated_question_budget": 2048,
+  "same_question_stream": true,
+  "results": {
+    "dynamic": {
+      "correct": 694,
+      "accuracy": 0.7259414225941423,
+      "vs_sft": {
+        "gains": 29,
+        "losses": 14,
+        "delta_percentage_points": 1.5690376569037656
+      },
+      "optimizer_steps": 241,
+      "optimizer_steps_skipped": 0,
+      "question_presentations": 2048,
+      "unique_questions": 2048,
+      "generated_completion_tokens": 302220,
+      "train_seconds": 11754.549510856,
+      "gpu_hours": 3.2651526419044448,
+      "sampling_metrics": {
+        "generated_groups": 2048,
+        "retained_active_groups": 458,
+        "fallback_zero_groups": 24,
+        "discarded_active_groups": 28,
+        "trained_groups": 482,
+        "retained_active_fraction": 0.950207468879668
+      },
+      "metrics": {
+        "num_excluded": 0,
+        "num_questions": 956,
+        "accuracy": 0.7259414225941423,
+        "greedy_execution_accuracy": 0.7259414225941423,
+        "greedy_execution_accuracy_allow_untagged": 0.7259414225941423,
+        "out_no_sql_allow_untagged": 0.0,
+        "out_no_sql": 0.0,
+        "out_exec_error": 0.07635983263598327,
+        "out_wrong": 0.19769874476987448,
+        "out_correct": 0.7259414225941423,
+        "format_ok": 1.0,
+        "truncated": 0.0,
+        "prompt_tokens_mean": 525.8326359832636,
+        "prompt_tokens_max": 1415,
+        "completion_tokens_mean": 37.04602510460251,
+        "gen_time_s": 124.57870960235596
+      }
+    },
+    "ordinary": {
+      "correct": 703,
+      "accuracy": 0.7353556485355649,
+      "vs_sft": {
+        "gains": 49,
+        "losses": 25,
+        "delta_percentage_points": 2.510460251046025
+      },
+      "optimizer_steps": 1024,
+      "optimizer_steps_skipped": 0,
+      "question_presentations": 2048,
+      "unique_questions": 2048,
+      "generated_completion_tokens": 302999,
+      "train_seconds": 18842.232373105002,
+      "gpu_hours": 5.233953436973612,
+      "sampling_metrics": {
+        "generated_groups": 2048,
+        "retained_active_groups": 432,
+        "fallback_zero_groups": 0,
+        "discarded_active_groups": 0,
+        "trained_groups": 2048,
+        "retained_active_fraction": 0.2109375
+      },
+      "metrics": {
+        "num_excluded": 0,
+        "num_questions": 956,
+        "accuracy": 0.7353556485355649,
+        "greedy_execution_accuracy": 0.7353556485355649,
+        "greedy_execution_accuracy_allow_untagged": 0.7353556485355649,
+        "out_no_sql_allow_untagged": 0.0010460251046025104,
+        "out_no_sql": 0.0010460251046025104,
+        "out_exec_error": 0.0596234309623431,
+        "out_wrong": 0.20397489539748953,
+        "out_correct": 0.7353556485355649,
+        "format_ok": 0.9989539748953975,
+        "truncated": 0.0010460251046025104,
+        "prompt_tokens_mean": 525.8326359832636,
+        "prompt_tokens_max": 1415,
+        "completion_tokens_mean": 39.72071129707113,
+        "gen_time_s": 153.1933650970459
+      }
+    }
+  },
+  "dynamic_vs_ordinary": {
+    "gains": 20,
+    "losses": 29,
+    "delta_percentage_points": -0.9414225941422595
+  }
+}

@@ -1,0 +1,352 @@
+{
+  "manifest_sha256": "1c1c82fe943f872f786f47574ff804db2f57b893f8c3b0f611ff30c9848fc0db",
+  "baseline_correct": 679,
+  "runs": {
+    "enriched_grpo_5e-06": {
+      "archive": "others (1).zip",
+      "step": 128,
+      "snapshot": true,
+      "loss": "grpo",
+      "lr": 5e-06,
+      "cohort": "enriched",
+      "optimizer_steps_skipped": 0,
+      "question_groups": 256,
+      "reward_groups": {
+        "all_correct": 81,
+        "none_correct": 83,
+        "mixed": 92
+      },
+      "train_seconds": null,
+      "adapter_sha256": "439d5fdef4c47352991646310fda66db6c63d47e2506b37c5d369c6e3b75c375",
+      "status": "snapshot_only"
+    },
+    "uniform_grpo_5e-06": {
+      "archive": "others (2).zip",
+      "step": 384,
+      "snapshot": false,
+      "loss": "grpo",
+      "lr": 5e-06,
+      "cohort": "uniform",
+      "optimizer_steps_skipped": 0,
+      "question_groups": 768,
+      "reward_groups": {
+        "all_correct": 524,
+        "none_correct": 67,
+        "mixed": 177
+      },
+      "train_seconds": 6257.004849044999,
+      "adapter_sha256": "58ea83b74b469617a2f2797c178456c7da979fe5351500bf74ca60da51702fa6",
+      "status": "trained_not_evaluated"
+    },
+    "uniform_grpo_2.5e-06": {
+      "archive": "others (3).zip",
+      "step": 384,
+      "snapshot": false,
+      "loss": "grpo",
+      "lr": 2.5e-06,
+      "cohort": "uniform",
+      "optimizer_steps_skipped": 0,
+      "question_groups": 768,
+      "reward_groups": {
+        "all_correct": 516,
+        "none_correct": 60,
+        "mixed": 192
+      },
+      "train_seconds": 6268.229846637998,
+      "adapter_sha256": "4715b209b04fc6fdc25b0a809d97e6c10695fbc3c10a937ab50a41e96fa31b46",
+      "status": "evaluated_sql_replayed",
+      "train_wrong_fraction": 0.08072916666666667,
+      "correct": 683,
+      "metrics": {
+        "num_excluded": 0,
+        "num_questions": 956,
+        "accuracy": 0.7144351464435147,
+        "greedy_execution_accuracy": 0.7144351464435147,
+        "greedy_execution_accuracy_allow_untagged": 0.7144351464435147,
+        "out_no_sql_allow_untagged": 0.0,
+        "out_no_sql": 0.0,
+        "out_exec_error": 0.08054393305439331,
+        "out_wrong": 0.20502092050209206,
+        "out_correct": 0.7144351464435147,
+        "format_ok": 1.0,
+        "truncated": 0.0,
+        "prompt_tokens_mean": 525.8326359832636,
+        "prompt_tokens_max": 1415,
+        "completion_tokens_mean": 37.12029288702929,
+        "gen_time_s": 124.0792224407196
+      },
+      "vs_sft": {
+        "gains": 25,
+        "losses": 21,
+        "delta_pp": 0.41841004184100417
+      }
+    },
+    "enriched_grpo_2.5e-06": {
+      "archive": "others (4).zip",
+      "step": 384,
+      "snapshot": false,
+      "loss": "grpo",
+      "lr": 2.5e-06,
+      "cohort": "enriched",
+      "optimizer_steps_skipped": 0,
+      "question_groups": 768,
+      "reward_groups": {
+        "all_correct": 278,
+        "none_correct": 255,
+        "mixed": 235
+      },
+      "train_seconds": 7208.787151420998,
+      "adapter_sha256": "ff2d49cc975adb57b4c43094c0e62485c9fde7c80452683c2574d0ffc0213632",
+      "status": "evaluated_sql_replayed",
+      "train_wrong_fraction": 0.5,
+      "correct": 689,
+      "metrics": {
+        "num_excluded": 0,
+        "num_questions": 956,
+        "accuracy": 0.7207112970711297,
+        "greedy_execution_accuracy": 0.7207112970711297,
+        "greedy_execution_accuracy_allow_untagged": 0.7207112970711297,
+        "out_no_sql_allow_untagged": 0.0010460251046025104,
+        "out_no_sql": 0.0010460251046025104,
+        "out_exec_error": 0.07112970711297072,
+        "out_wrong": 0.20711297071129708,
+        "out_correct": 0.7207112970711297,
+        "format_ok": 0.9989539748953975,
+        "truncated": 0.0010460251046025104,
+        "prompt_tokens_mean": 525.8326359832636,
+        "prompt_tokens_max": 1415,
+        "completion_tokens_mean": 40.00836820083682,
+        "gen_time_s": 143.58185744285583
+      },
+      "vs_sft": {
+        "gains": 42,
+        "losses": 32,
+        "delta_pp": 1.0460251046025104
+      }
+    },
+    "uniform_dapo_2.5e-06": {
+      "archive": "others (5).zip",
+      "step": 384,
+      "snapshot": false,
+      "loss": "dapo",
+      "lr": 2.5e-06,
+      "cohort": "uniform",
+      "optimizer_steps_skipped": 0,
+      "question_groups": 768,
+      "reward_groups": {
+        "all_correct": 507,
+        "none_correct": 62,
+        "mixed": 199
+      },
+      "train_seconds": 6357.901931554,
+      "adapter_sha256": "508c8de08a88215fe2c6c040f66826a0a9096ec4ea1925832c132e556e84e71f",
+      "status": "evaluated_sql_replayed",
+      "train_wrong_fraction": 0.08072916666666667,
+      "correct": 687,
+      "metrics": {
+        "num_excluded": 0,
+        "num_questions": 956,
+        "accuracy": 0.7186192468619247,
+        "greedy_execution_accuracy": 0.7186192468619247,
+        "greedy_execution_accuracy_allow_untagged": 0.7186192468619247,
+        "out_no_sql_allow_untagged": 0.0,
+        "out_no_sql": 0.0,
+        "out_exec_error": 0.07845188284518828,
+        "out_wrong": 0.20292887029288703,
+        "out_correct": 0.7186192468619247,
+        "format_ok": 1.0,
+        "truncated": 0.0,
+        "prompt_tokens_mean": 525.8326359832636,
+        "prompt_tokens_max": 1415,
+        "completion_tokens_mean": 36.69665271966527,
+        "gen_time_s": 118.51607847213745
+      },
+      "vs_sft": {
+        "gains": 25,
+        "losses": 17,
+        "delta_pp": 0.8368200836820083
+      }
+    },
+    "enriched_dapo_2.5e-06": {
+      "archive": "others (6).zip",
+      "step": 384,
+      "snapshot": false,
+      "loss": "dapo",
+      "lr": 2.5e-06,
+      "cohort": "enriched",
+      "optimizer_steps_skipped": 0,
+      "question_groups": 768,
+      "reward_groups": {
+        "all_correct": 285,
+        "none_correct": 261,
+        "mixed": 222
+      },
+      "train_seconds": 7252.130756999999,
+      "adapter_sha256": "b48581405415df60125a5ae522cbd03b7e3ba45be0e9b7f6a6a075e069787c32",
+      "status": "evaluated_sql_replayed",
+      "train_wrong_fraction": 0.5,
+      "correct": 679,
+      "metrics": {
+        "num_excluded": 0,
+        "num_questions": 956,
+        "accuracy": 0.7102510460251046,
+        "greedy_execution_accuracy": 0.7102510460251046,
+        "greedy_execution_accuracy_allow_untagged": 0.7102510460251046,
+        "out_no_sql_allow_untagged": 0.0,
+        "out_no_sql": 0.0,
+        "out_exec_error": 0.0794979079497908,
+        "out_wrong": 0.2102510460251046,
+        "out_correct": 0.7102510460251046,
+        "format_ok": 1.0,
+        "truncated": 0.0,
+        "prompt_tokens_mean": 525.8326359832636,
+        "prompt_tokens_max": 1415,
+        "completion_tokens_mean": 36.55753138075314,
+        "gen_time_s": 122.4024748802185
+      },
+      "vs_sft": {
+        "gains": 30,
+        "losses": 30,
+        "delta_pp": 0.0
+      }
+    }
+  },
+  "contrasts": {
+    "enriched_dapo_2.5e-06 vs uniform_dapo_2.5e-06": {
+      "gains": 21,
+      "losses": 29,
+      "delta_pp": -0.8368200836820083
+    },
+    "enriched_grpo_2.5e-06 vs uniform_grpo_2.5e-06": {
+      "gains": 36,
+      "losses": 30,
+      "delta_pp": 0.6276150627615062
+    },
+    "uniform_grpo_2.5e-06 vs uniform_dapo_2.5e-06": {
+      "gains": 10,
+      "losses": 14,
+      "delta_pp": -0.41841004184100417
+    },
+    "enriched_grpo_2.5e-06 vs enriched_dapo_2.5e-06": {
+      "gains": 33,
+      "losses": 23,
+      "delta_pp": 1.0460251046025104
+    }
+  },
+  "archives": {
+    "others (1).zip": {
+      "sha256": "c75ac3fef98bbc28ccf32c20a2556a2dd102e13d3f5579adea706bb30523beef",
+      "members": [
+        "grpo_checkpoint_128.zip"
+      ]
+    },
+    "others (2).zip": {
+      "sha256": "e1dea72741c379ddefd37b85a15d72a4593ca8cda5262536ac72215d4458df0a",
+      "members": [
+        "grpo_checkpoint_384.zip",
+        "grpo_checkpoint_128.zip",
+        "grpo_adapter.zip",
+        "run.json",
+        "grpo_checkpoint_256.zip"
+      ]
+    },
+    "others (3).zip": {
+      "sha256": "9914ceadeaa125dee41e698510209dcd3ed86578a244bf66620e73b7ffd87ba4",
+      "members": [
+        "grpo_checkpoint_128.zip",
+        "metrics.json",
+        "run.json",
+        "grpo_adapter.zip",
+        "validation.jsonl",
+        "selection.json",
+        "uniform.json",
+        "grpo_checkpoint_384.zip",
+        "plan.json",
+        "grpo_checkpoint_256.zip"
+      ]
+    },
+    "others (4).zip": {
+      "sha256": "8e0b9b9530c1a3b10791d95d72ccb33a2176601a9bf235045f810b6f700c0ba1",
+      "members": [
+        "grpo_checkpoint_128.zip",
+        "validation.jsonl",
+        "metrics.json",
+        "enriched.json",
+        "grpo_checkpoint_384.zip",
+        "selection.json",
+        "grpo_checkpoint_256.zip",
+        "plan.json",
+        "run.json",
+        "grpo_adapter.zip"
+      ]
+    },
+    "others (5).zip": {
+      "sha256": "21d7ef1763eba14793a9a1be4b1f9ffcd43c793714aedb5e9a3bcb65a3b793f9",
+      "members": [
+        "selection.json",
+        "grpo_checkpoint_384.zip",
+        "plan.json",
+        "grpo_checkpoint_256.zip",
+        "grpo_checkpoint_128.zip",
+        "run.json",
+        "metrics.json",
+        "validation.jsonl",
+        "uniform.json",
+        "grpo_adapter.zip"
+      ]
+    },
+    "others (6).zip": {
+      "sha256": "a439130aa1418d6e2b8a2fedf33ee20aabad391bd8a8cac44ed9286663ae9436",
+      "members": [
+        "grpo_checkpoint_128.zip",
+        "run.json",
+        "enriched.json",
+        "metrics.json",
+        "validation.jsonl",
+        "grpo_checkpoint_256.zip",
+        "grpo_adapter.zip",
+        "grpo_checkpoint_384.zip",
+        "selection.json",
+        "plan.json"
+      ]
+    },
+    "others (7).zip": {
+      "sha256": "810b3e8ddc4195eb9a21f8777cdce95bba142d297b2d69116de53e6804709c6d",
+      "members": [
+        "Qwen3.5-2B_none.json"
+      ]
+    },
+    "others (8).zip": {
+      "sha256": "246f781f981be8adf48cd4c012803947e1d2473faa7331a74fea7ae7430e2a0b",
+      "members": [
+        "Qwen3.5-2B_none.json"
+      ]
+    }
+  },
+  "train_audit": {
+    "num_excluded": 225,
+    "num_questions": 5819,
+    "accuracy": 0.8553015982127513,
+    "greedy_execution_accuracy": 0.8553015982127513,
+    "greedy_execution_accuracy_allow_untagged": 0.8553015982127513,
+    "out_no_sql_allow_untagged": 0.0005155525004296271,
+    "out_no_sql": 0.0005155525004296271,
+    "out_exec_error": 0.03918199003265166,
+    "out_wrong": 0.10500085925416738,
+    "out_correct": 0.8553015982127513,
+    "format_ok": 0.9994844474995703,
+    "truncated": 0.0005155525004296271,
+    "prompt_tokens_mean": 550.2498711118749,
+    "prompt_tokens_max": 2588,
+    "completion_tokens_mean": 37.02079395085066,
+    "gen_time_s": 829.8849837779999
+  },
+  "cohort_overlap": 446,
+  "notes": [
+    "384 steps for four evaluated trials, same SFT, same frozen validation, same greedy settings. All 3824 saved validation SQL outcomes were independently replayed.",
+    "All available adapters were extracted from final bundles or latest available snapshot. Original archives retain intermediate checkpoints.",
+    "Train audit and wrong-cohort fractions are inherited from matching selection reports; per-question train audit outputs were not present in these archives.",
+    "No validation for either LR 5e-6 trial. Enriched LR 5e-6 has only step-128 snapshot. No LR effect conclusion.",
+    "One seed and validation-based selection; comparison to historical best has unequal training budgets."
+  ]
+}
